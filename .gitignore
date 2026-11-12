@@ -86,3 +86,7 @@ frontend/test-results/
 frontend/playwright-report/
 frontend/blob-report/
 frontend/.last-run.json
+
+# secrets and backups (agent rule 2026-11-12)
+*.bak*
+secrets/
