@@ -45,6 +45,10 @@ RomM (ROM Manager) allows you to scan, enrich, browse and play your game collect
 
 To start using RomM, check out the [Quick Start Guide][docs-quick-start-guide] in the docs. If you are having issues with RomM, please review the page for [troubleshooting steps][docs-troubleshooting].
 
+## Security
+
+Report vulnerabilities as described in [SECURITY.md](./SECURITY.md). Frontend dependency floors in `frontend/package.json` track the patched releases listed in [docs/changelog.md](./docs/changelog.md).
+
 ## Contributing
 
 To contribute to RomM, please check [Contribution Guide](./CONTRIBUTING.md).
