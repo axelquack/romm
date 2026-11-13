@@ -139,6 +139,10 @@ ln -s ../romm_mock/assets assets/romm/assets
 npm run dev
 ```
 
+## Dev container
+
+Opening the repo in a dev container runs an `initializeCommand` that copies `.devcontainer/dev.env.example` to `.devcontainer/dev.env` when the local file is missing. `.devcontainer/dev.env` is gitignored. The example values are disposable placeholders. Root Compose still reads `.env`, created from `env.template`.
+
 ## Setting up the linter
 
 We use [Trunk](https://trunk.io) for linting, which combines multiple linters and formatters with sensible defaults and a single configuration file. You'll need to install the Trunk CLI to use it.

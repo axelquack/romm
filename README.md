@@ -47,7 +47,9 @@ To start using RomM, check out the [Quick Start Guide][docs-quick-start-guide] i
 
 ## Security
 
-Report vulnerabilities as described in [SECURITY.md](./SECURITY.md). Frontend dependency floors in `frontend/package.json` track the patched releases listed in [docs/changelog.md](./docs/changelog.md).
+Report vulnerabilities as described in [SECURITY.md](./SECURITY.md). Dependabot alerts and automatic security updates are enabled on this fork. Frontend dependency floors in `frontend/package.json` track the patched releases listed in [docs/changelog.md](./docs/changelog.md).
+
+Dev container defaults live in `.devcontainer/dev.env.example`. The dev container copies that file to `.devcontainer/dev.env` when the local file is missing, and `.devcontainer/dev.env` is gitignored.
 
 ## Contributing
 

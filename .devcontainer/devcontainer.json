@@ -42,6 +42,7 @@
       }
     }
   },
+  "initializeCommand": "sh -c 'test -f .devcontainer/dev.env || cp .devcontainer/dev.env.example .devcontainer/dev.env'",
   "postCreateCommand": "echo 'ROMM development environment ready!'",
   "remoteUser": "root"
 }
