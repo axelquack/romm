@@ -19,3 +19,7 @@ Please include as much of the information listed below as you can to help us bet
 - Impact of the issue (including how an attacker might exploit the issue)
 
 This information will help us investigate and patch the issue more quickly.
+
+## Dependency updates
+
+Dependabot alerts and automatic security updates are enabled on this fork as of 2026-11-13.
