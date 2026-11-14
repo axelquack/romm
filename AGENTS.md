@@ -22,6 +22,12 @@ Standing rule from Axel (2026-11-12), for every Grok bot and herdr agent working
 - If the repo has no remote, commit locally and report that.
 - Commit only your own change; do not sweep in someone else's uncommitted work.
 
+Confirmed by Axel (2026-11-14) for every Grok Bot and Herdr agent:
+
+- Document each change in this repo's own files (README, `docs/`, changelog). A memory note, chat message, or handoff outside the repo does not count.
+- Then commit and push to the existing remote after the secret check. Stage by explicit path only (no `git add -A` or `git add .`).
+- Force-pushes and history rewrites need Axel's explicit approval.
+
 ## Work tracking
 
 Rule from the owner (2026-11-13): all open work goes on the owner's private GitHub Project board, not into new TODO.md items or chat-only lists.
