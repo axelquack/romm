@@ -2,7 +2,6 @@
 
 This file holds the fork rules and the upstream repository guide. [CLAUDE.md](CLAUDE.md) is a symlink to this file.
 
-
 ## Role
 
 - **Project:** Axel's public fork of RomM (rommapp/romm), a self-hosted ROM manager and player. `origin` is `axelquack/romm`; `upstream` is `rommapp/romm`. Recent fork work is Demozoo, Pouet, and CSDb scene metadata.
@@ -41,7 +40,7 @@ Rule from the owner (2026-11-13): all open work goes on the owner's private GitH
 
 ---
 
-# RomM - Repository Guide for Contributors & Agents
+## RomM - Repository Guide for Contributors & Agents
 
 RomM is a self-hosted ROM manager and player: scan a game library off disk, enrich it with metadata from 10+ providers, browse it in a web UI, and play in the browser.
 

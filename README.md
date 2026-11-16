@@ -67,7 +67,6 @@ Report vulnerabilities as described in [SECURITY.md](./SECURITY.md). Dependabot 
 
 Dev container defaults live in `.devcontainer/dev.env.example`. The dev container copies that file to `.devcontainer/dev.env` when the local file is missing, and `.devcontainer/dev.env` is gitignored.
 
-
 ## Official apps
 
 ### <a href="https://github.com/rommapp/playnite-plugin"><img src=".github/resources/screenshots/app-playnite.webp" width="420" align="left" alt="Playnite library" /></a><a href="https://github.com/rommapp/playnite-plugin"><img src=".github/resources/playnite-logo.svg" height="28" align="top" alt="Playnite logo" /></a> Playnite plugin

@@ -125,7 +125,8 @@
       "@vitest/browser-playwright": "$@vitest/browser-playwright"
     },
     "follow-redirects": "1.16.2",
-    "fast-uri": "3.1.9"
+    "fast-uri": "3.1.9",
+    "glob": "14.0.2"
   },
   "engines": {
     "node": "26",
