@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-16
+
+- Merged upstream `rommapp/romm` `master` (07b193c, 15 Nov 2026) into this fork. The fork was 2,518 commits behind and 13 commits ahead. Those 13 were documentation, the `.devcontainer/dev.env` gitignore, and earlier dependency bumps.
+- Conflicts were resolved by taking upstream `uv.lock`, `pyproject.toml`, `frontend/package.json`, and `frontend/package-lock.json`, and by keeping the fork notes in `AGENTS.md`, `SECURITY.md`, `docs/changelog.md`, the `.devcontainer/dev.env` gitignore, and the security and dev-container notes in `README.md` and `DEVELOPER_SETUP.md`.
+- `CLAUDE.md` is now a symlink to `AGENTS.md`. Upstream moved the repository guide into `AGENTS.md` and deleted `CLAUDE.md`.
+- After the sync, the upstream lockfiles already include patched releases for certifi, anyio, aiohttp, urllib3, cryptography, js-yaml, nanoid, source-map-js, browserslist, and the fast-uri highs.
+- Added npm overrides for `follow-redirects` 1.16.2 (upstream still had 1.16.1) and `fast-uri` 3.1.9. `npm audit` in `frontend/` then reports 0 high and 0 critical findings. A further override pins `glob` to 14.0.2 (GHSA-3g3m-2fjr-6pw4). Trunk CI also required a single top-level heading in `AGENTS.md` and Prettier formatting of the resolved markdown files.
+
 ## 2026-11-14
 
 - Bump Pillow from 12.3.0 to 13.0.0 (#1).

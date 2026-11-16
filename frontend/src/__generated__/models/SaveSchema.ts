@@ -5,6 +5,9 @@
 import type { DeviceSyncSchema } from './DeviceSyncSchema';
 import type { ScreenshotSchema } from './ScreenshotSchema';
 export type SaveSchema = {
+    channel_id?: (string | null);
+    is_favorite?: boolean;
+    labels?: Array<string>;
     id: number;
     rom_id: number;
     user_id: number;

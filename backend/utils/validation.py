@@ -25,8 +25,8 @@ EMAIL_PATTERN = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
 MAX_ROM_IDS_PER_QUERY: Final = 500
 
 
-def _dedupe_rom_ids(rom_ids: list[int] | None) -> list[int] | None:
-    return None if rom_ids is None else list(dict.fromkeys(rom_ids))
+def dedupe_in_order[T](items: list[T] | None) -> list[T] | None:
+    return None if items is None else list(dict.fromkeys(items))
 
 
 # Shared by every route that scopes a query to a set of ROMs, so the cap and
@@ -34,7 +34,7 @@ def _dedupe_rom_ids(rom_ids: list[int] | None) -> list[int] | None:
 RomIdScope = Annotated[
     list[Annotated[int, Field(gt=0)]] | None,
     Field(max_length=MAX_ROM_IDS_PER_QUERY),
-    AfterValidator(_dedupe_rom_ids),
+    AfterValidator(dedupe_in_order),
 ]
 
 
@@ -120,6 +120,34 @@ def validate_username(username: str) -> None:
         raise ValidationError(msg, "Username")
 
 
+def sanitize_username(username: str, fallback: str = "user") -> str:
+    """Coerce an externally supplied username into one `validate_username` accepts.
+
+    An identity provider is free to hand out names RomM's own rules reject
+    (`first.last`, an email address, non-ASCII), and an account carrying one
+    can't be edited afterwards.
+
+    Args:
+        username (str): The username as the provider sent it
+        fallback (str): Stem to use when nothing usable survives
+
+    Returns:
+        str: A username that satisfies `validate_username`
+    """
+    sanitized = re.sub(r"[^a-zA-Z0-9_-]+", "-", username).strip("-")[:TEXT_FIELD_LENGTH]
+
+    # Same floor as `validate_username`, and a bare "a-" style remnant is no
+    # more recognizable than the fallback.
+    if len(sanitized) < 3:
+        sanitized = re.sub(r"[^a-zA-Z0-9_-]+", "-", fallback).strip("-")[
+            :TEXT_FIELD_LENGTH
+        ]
+    if len(sanitized) < 3:
+        sanitized = "user"
+
+    return sanitized
+
+
 def validate_password(password: str) -> None:
     """Validate password format and content.
 
@@ -160,6 +188,11 @@ def validate_email(email: str) -> None:
         return
 
     validate_ascii_only(email, "Email")
+
+    if len(email) > TEXT_FIELD_LENGTH:
+        msg = f"Email must be no more than {TEXT_FIELD_LENGTH} characters long"
+        log.error(msg)
+        raise ValidationError(msg, "Email")
 
     if not EMAIL_PATTERN.match(email):
         msg = "Invalid email format"

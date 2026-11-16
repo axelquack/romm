@@ -4,7 +4,7 @@ import base64
 import json
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import ForeignKey, Index, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from config import FRONTEND_RESOURCES_PATH
@@ -15,13 +15,17 @@ if TYPE_CHECKING:
     from models.rom import Rom
     from models.user import User
 
+COLLECTION_NAME_MAX_LENGTH = 400
+
 
 class Collection(BaseModel):
     __tablename__ = "collections"
 
+    __table_args__ = (Index("ix_collections_updated_at", "updated_at"),)
+
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
-    name: Mapped[str] = mapped_column(String(length=400))
+    name: Mapped[str] = mapped_column(String(length=COLLECTION_NAME_MAX_LENGTH))
     description: Mapped[str | None] = mapped_column(Text)
     is_public: Mapped[bool] = mapped_column(default=False)
     is_favorite: Mapped[bool] = mapped_column(default=False)
@@ -120,6 +124,8 @@ class VirtualCollectionRom(BaseModel):
 
     __tablename__ = "virtual_collection_roms"
 
+    __table_args__ = (Index("idx_virtual_collection_roms_rom_id", "rom_id"),)
+
     type: Mapped[str] = mapped_column(String(length=50), primary_key=True)
     name: Mapped[str] = mapped_column(String(length=400), primary_key=True)
     rom_id: Mapped[int] = mapped_column(
@@ -158,7 +164,7 @@ class VirtualCollection(BaseModel):
         return base64.urlsafe_b64encode(data.encode()).decode()
 
     @classmethod
-    def from_id(cls, id_: str):
+    def from_id(cls, id_: str) -> tuple[str, str]:
         data = json.loads(base64.urlsafe_b64decode(id_).decode())
         return data["name"], data["type"]
 
@@ -205,12 +211,13 @@ SMART_COLLECTION_MAX_COVERS = 5
 class SmartCollection(BaseModel):
     __tablename__ = "smart_collections"
 
+    __table_args__ = (Index("ix_smart_collections_updated_at", "updated_at"),)
+
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
-    name: Mapped[str] = mapped_column(String(length=400))
+    name: Mapped[str] = mapped_column(String(length=COLLECTION_NAME_MAX_LENGTH))
     description: Mapped[str | None] = mapped_column(Text)
     is_public: Mapped[bool] = mapped_column(default=False)
-    rom_count: Mapped[int] = mapped_column(default=0)
     rom_ids: Mapped[list[int]] = mapped_column(
         CustomJSON(), default=[], doc="Rom IDs that belong to this smart collection"
     )
@@ -231,6 +238,10 @@ class SmartCollection(BaseModel):
     @property
     def owner_username(self) -> str:
         return self.user.username
+
+    @property
+    def rom_count(self) -> int:
+        return len(self.rom_ids)
 
     @property
     def path_cover_small(self) -> str | None:

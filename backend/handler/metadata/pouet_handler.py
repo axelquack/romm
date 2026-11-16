@@ -7,21 +7,25 @@ Never parse ``prod.php`` HTML (ambiguous titles stay unmatched).
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, Final, NotRequired, TypedDict
 from urllib.parse import parse_qs, urlencode, urlparse
 
-import httpx
-from fastapi import HTTPException, status
+import httpx2
 
+from adapters.services.provider_http import unavailable
 from config import POUET_API_ENABLED
 from logger.logger import log
 from utils import get_version, int_or_none
 from utils.context import ctx_httpx_client
 from utils.rate_limiter import RateLimiter
 
-from .base_handler import BaseRom, MetadataHandler
+from .base_handler import (
+    BaseRom,
+    MetadataHandler,
+    provider_tag_regex,
+    tag_id_from_filename,
+)
 from .demozoo_handler import (
     DEMOZOO_PROD_PAGE,
     _append_unique,
@@ -31,7 +35,7 @@ from .demozoo_handler import (
     http_url,
 )
 
-POUET_TAG_REGEX = re.compile(r"\(pouet-(\d+)\)", re.IGNORECASE)
+POUET_TAG_REGEX = provider_tag_regex("pouet")
 POUET_WHICH_RE = re.compile(r"which=(\d+)", re.IGNORECASE)
 POUET_API_PROD: Final[str] = "https://api.pouet.net/v1/prod/"
 POUET_PROD_PAGE: Final[str] = "https://www.pouet.net/prod.php?which={id}"
@@ -71,10 +75,7 @@ class PouetRom(BaseRom):
 
 def extract_pouet_id_from_filename(fs_name: str) -> int | None:
     """Extract Pouët ID from a filename tag like ``(pouet-99)``."""
-    match = POUET_TAG_REGEX.search(fs_name)
-    if match:
-        return int_or_none(match.group(1))
-    return None
+    return tag_id_from_filename(POUET_TAG_REGEX, fs_name)
 
 
 def pouet_id_from_location(location: str) -> int | None:
@@ -94,7 +95,7 @@ def pouet_id_from_location(location: str) -> int | None:
 def _float_or_none(value: Any) -> float | None:
     try:
         return float(value) if value is not None and value != "" else None
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -304,46 +305,21 @@ class PouetHandler(MetadataHandler):
     def is_enabled(cls) -> bool:
         return POUET_API_ENABLED
 
-    async def _request(self, url: str) -> dict:
+    async def _request(self, url: str) -> dict[str, Any]:
         await _rate_limiter.acquire()
-        headers = {
-            "User-Agent": f"RomM/{get_version()}",
-            "Accept": "application/json",
-        }
-        try:
-            body = await self._fetch_capped(url, headers=headers)
-        except (httpx.HTTPStatusError, httpx.ConnectError, httpx.ReadTimeout) as exc:
-            log.warning("Can't connect to Pouët API", extra={"exception": str(exc)})
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Can't connect to Pouët API, check your internet connection",
-            ) from exc
-        if body is None:
-            return {}
-        try:
-            data = json.loads(body)
-        except ValueError as exc:
-            log.error("Error decoding JSON from Pouët: %s", exc)
-            return {}
-        return data if isinstance(data, dict) else {}
+        return await self._get_capped_json(url, provider="Pouët API")
 
     async def heartbeat(self) -> bool:
-        if not self.is_enabled():
-            return False
-        try:
+        async def probe() -> bool:
             data = await self._request(f"{POUET_API_PROD}?id=99")
-        except Exception as exc:
-            log.error("Error checking Pouët API: %s", exc)
-            return False
-        return bool(data.get("success"))
+            return bool(data.get("success"))
+
+        return await self._heartbeat("Pouët API", probe)
 
     async def get_rom_by_id(self, pouet_id: int) -> PouetRom:
         if not self.is_enabled() or not pouet_id:
             return PouetRom(pouet_id=None)
-        try:
-            data = await self._request(f"{POUET_API_PROD}?id={int(pouet_id)}")
-        except HTTPException:
-            return PouetRom(pouet_id=None)
+        data = await self._request(f"{POUET_API_PROD}?id={int(pouet_id)}")
         prod = data.get("prod")
         if not data.get("success") or not isinstance(prod, dict) or not prod.get("id"):
             return PouetRom(pouet_id=None)
@@ -373,9 +349,9 @@ class PouetHandler(MetadataHandler):
                 if res.status_code not in {301, 302, 303, 307, 308}:
                     return None
                 return pouet_id_from_location(res.headers.get("location") or "")
-        except (httpx.ConnectError, httpx.ReadTimeout) as exc:
+        except (httpx2.ConnectError, httpx2.ReadTimeout) as exc:
             log.warning("Pouët title search failed: %s", exc)
-            return None
+            raise unavailable("Pouët API") from exc
 
     async def get_rom(self, fs_name: str, platform_slug: str) -> PouetRom:
         """Tag first; otherwise unique-title 302. No HTML list parse."""

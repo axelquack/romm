@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import status
 from fastapi.testclient import TestClient
+from tests.auth_helpers import bearer
 
 from endpoints.roms import walkthrough as walkthrough_endpoint
 from handler.database import db_rom_handler
@@ -13,48 +14,12 @@ TXT_BYTES = b"Chrono Trigger walkthrough\n\nStep 1: leave home.\n"
 GAMEFAQS_URL = "https://gamefaqs.gamespot.com/snes/563538-chrono-trigger/faqs/1"
 
 
-def _auth(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
-
-
 @pytest.fixture
-def walkthrough_fs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Mock fs_rom_handler so walkthrough writes land in tmp_path."""
-    folder_dir = tmp_path / "library"
-    folder_dir.mkdir()
-
-    def validate_path(path: str) -> Path:
-        return folder_dir / Path(path).name
-
-    async def remove_file(path: str) -> None:
-        target = folder_dir / Path(path).name
-        if target.exists():
-            target.unlink()
-        else:
-            raise FileNotFoundError(path)
-
-    async def write_file(file, path: str, filename: str) -> None:
-        (folder_dir / filename).write_bytes(file)
-
-    monkeypatch.setattr(
-        walkthrough_endpoint.fs_rom_handler, "validate_path", validate_path
-    )
-    monkeypatch.setattr(
-        walkthrough_endpoint.fs_rom_handler,
-        "make_directory",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        walkthrough_endpoint.fs_rom_handler,
-        "remove_file",
-        AsyncMock(side_effect=remove_file),
-    )
-    monkeypatch.setattr(
-        walkthrough_endpoint.fs_rom_handler,
-        "write_file",
-        AsyncMock(side_effect=write_file),
-    )
-    return folder_dir
+def walkthrough_fs(game_folder_on_disk: Path) -> Path:
+    """The ROM's walkthrough folder inside a real temp library."""
+    media_dir = game_folder_on_disk / "walkthrough"
+    media_dir.mkdir()
+    return media_dir
 
 
 # ---------- POST /api/roms/{id}/walkthroughs/files ----------
@@ -69,7 +34,7 @@ def test_upload_walkthrough_file_success(
     response = client.post(
         f"/api/roms/{game_folder_rom.id}/walkthroughs/files",
         headers={
-            **_auth(access_token),
+            **bearer(access_token),
             "x-upload-filename": "guide.txt",
             "x-doc-author": "John%20Doe",
             "x-doc-title": "Full%20Walkthrough",
@@ -99,7 +64,7 @@ def test_upload_walkthrough_rejects_unsupported_extension(
 ):
     response = client.post(
         f"/api/roms/{game_folder_rom.id}/walkthroughs/files",
-        headers={**_auth(access_token), "x-upload-filename": "guide.exe"},
+        headers={**bearer(access_token), "x-upload-filename": "guide.exe"},
         files={"guide.exe": ("guide.exe", b"nope", "application/octet-stream")},
     )
 
@@ -114,7 +79,7 @@ def test_upload_walkthrough_rom_not_found(
 ):
     response = client.post(
         "/api/roms/999999/walkthroughs/files",
-        headers={**_auth(access_token), "x-upload-filename": "guide.txt"},
+        headers={**bearer(access_token), "x-upload-filename": "guide.txt"},
         files={"guide.txt": ("guide.txt", TXT_BYTES, "text/plain")},
     )
     assert response.status_code == status.HTTP_404_NOT_FOUND
@@ -142,7 +107,7 @@ def test_delete_walkthrough_file(
 
     response = client.delete(
         f"/api/roms/{game_folder_rom.id}/walkthroughs/files/{rom_file.id}",
-        headers=_auth(access_token),
+        headers=bearer(access_token),
     )
     assert response.status_code == status.HTTP_200_OK
     assert db_rom_handler.get_rom_file_by_id(rom_file.id) is None
@@ -160,7 +125,7 @@ def test_delete_walkthrough_rejects_non_walkthrough_file(
 
     response = client.delete(
         f"/api/roms/{game_folder_rom.id}/walkthroughs/files/{game_file.id}",
-        headers=_auth(access_token),
+        headers=bearer(access_token),
     )
     assert response.status_code == status.HTTP_404_NOT_FOUND
 
@@ -189,7 +154,7 @@ def test_add_gamefaqs_walkthrough_success(
 
     response = client.post(
         f"/api/roms/{game_folder_rom.id}/walkthroughs/gamefaqs",
-        headers=_auth(access_token),
+        headers=bearer(access_token),
         json={"url": GAMEFAQS_URL},
     )
 
@@ -201,6 +166,7 @@ def test_add_gamefaqs_walkthrough_success(
     assert len(files) == 1
     created = files[0]
     assert created.file_name == "chrono-trigger-faq.txt"
+    assert created.doc_meta is not None
     assert created.doc_meta.source == DocSource.GAMEFAQS
     assert created.doc_meta.source_url == GAMEFAQS_URL
     assert created.doc_meta.author == "Jane Roe"
@@ -217,7 +183,7 @@ def test_add_gamefaqs_walkthrough_rejects_bad_host(
 ):
     response = client.post(
         f"/api/roms/{game_folder_rom.id}/walkthroughs/gamefaqs",
-        headers=_auth(access_token),
+        headers=bearer(access_token),
         json={"url": "https://evil.example.com/guide"},
     )
     assert response.status_code == status.HTTP_400_BAD_REQUEST

@@ -1,13 +1,17 @@
 from unittest.mock import AsyncMock, patch
 
+import httpx2
 import pytest
+from fastapi import HTTPException, status
 
+from handler.metadata import csdb_handler
 from handler.metadata.csdb_handler import (
     CsdbHandler,
     csdb_id_from_url,
     extract_csdb_id_from_filename,
     production_from_xml,
 )
+from utils.context import ctx_httpx_client
 
 WORKING_STONE_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <CSDbData><Release>
@@ -110,3 +114,53 @@ async def test_request_returns_empty_when_over_the_cap():
     handler = CsdbHandler()
     with patch.object(CsdbHandler, "_fetch_capped", AsyncMock(return_value=None)):
         assert await handler._request("https://csdb.dk/webservice/?id=1") == ""
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        httpx2.Response(500),
+        httpx2.ConnectError("refused"),
+        httpx2.ConnectTimeout("slow"),
+        httpx2.ReadTimeout("slow"),
+        httpx2.RemoteProtocolError("dropped"),
+    ],
+    ids=["server_error", "refused", "connect_timeout", "read_timeout", "dropped"],
+)
+@pytest.mark.asyncio
+async def test_a_failed_request_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, reply: httpx2.Response | Exception
+):
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(csdb_handler._rate_limiter, "acquire", AsyncMock())
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(answer))
+    token = ctx_httpx_client.set(client)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            await CsdbHandler()._request("https://csdb.dk/webservice/?id=1")
+    finally:
+        ctx_httpx_client.reset(token)
+        await client.aclose()
+
+    assert exc.value.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_get_rom_by_id_propagates_an_unreachable_csdb():
+    """A dead connection has to stay distinguishable from a missing release."""
+    handler = CsdbHandler()
+    with (
+        patch.object(CsdbHandler, "is_enabled", return_value=True),
+        patch.object(
+            CsdbHandler,
+            "_request",
+            new_callable=AsyncMock,
+            side_effect=HTTPException(status_code=503, detail="down"),
+        ),
+        pytest.raises(HTTPException),
+    ):
+        await handler.get_rom_by_id(75330)

@@ -4,6 +4,9 @@
 /* eslint-disable */
 import type { ScreenshotSchema } from './ScreenshotSchema';
 export type StateSchema = {
+    channel_id?: (string | null);
+    is_favorite?: boolean;
+    labels?: Array<string>;
     id: number;
     rom_id: number;
     user_id: number;
@@ -19,7 +22,9 @@ export type StateSchema = {
     created_at: string;
     updated_at: string;
     emulator: (string | null);
+    core?: (string | null);
     is_public?: boolean;
     screenshot: (ScreenshotSchema | null);
+    origin_device_id?: (string | null);
 };
 

@@ -1,13 +1,19 @@
 import re
+from typing import Any
 
 from config import LAUNCHBOX_API_ENABLED
 from handler.filesystem import fs_rom_handler
 from handler.redis_handler import async_cache
 from logger.logger import log
+from utils.arcade_platforms import MAME_SHORTNAME_PLATFORMS
+from utils.cache import is_cache_store_ready
 from utils.database import safe_int
+from utils.platform_slugs import UniversalPlatformSlug as UPS
 
-from ..base_handler import MetadataHandler
-from ..base_handler import UniversalPlatformSlug as UPS
+from ..base_handler import (
+    MetadataHandler,
+    tag_id_from_filename,
+)
 from .local_source import LocalSource
 from .media import build_rom, local_media_req, remote_media_req
 from .platforms import get_platform
@@ -16,6 +22,7 @@ from .types import (
     DASH_COLON_REGEX,
     LAUNCHBOX_METADATA_INITIAL_IMPORT_KEY,
     LAUNCHBOX_METADATA_NAME_KEY,
+    LAUNCHBOX_METADATA_STORE,
     LAUNCHBOX_PLATFORMS_DIR,
     LAUNCHBOX_TAG_REGEX,
     LaunchboxPlatform,
@@ -42,7 +49,9 @@ class LaunchboxHandler(MetadataHandler):
 
     @staticmethod
     async def is_remote_store_populated() -> bool:
-        return bool(await async_cache.exists(LAUNCHBOX_METADATA_NAME_KEY))
+        return await is_cache_store_ready(
+            async_cache, LAUNCHBOX_METADATA_STORE, LAUNCHBOX_METADATA_NAME_KEY
+        )
 
     @staticmethod
     async def is_remote_store_importing() -> bool:
@@ -88,7 +97,7 @@ class LaunchboxHandler(MetadataHandler):
 
         if local is not None:
             launchbox_id_local = safe_int(local.get("DatabaseID"))
-            remote: dict | None = None
+            remote: dict[str, Any] | None = None
             if remote_available:
                 if launchbox_id_local:
                     remote = await self._remote.get_by_id(launchbox_id_local)
@@ -121,8 +130,7 @@ class LaunchboxHandler(MetadataHandler):
                 media_req=media_req,
             )
 
-        match = LAUNCHBOX_TAG_REGEX.search(fs_name)
-        launchbox_id_from_tag = int(match.group(1)) if match else None
+        launchbox_id_from_tag = tag_id_from_filename(LAUNCHBOX_TAG_REGEX, fs_name)
 
         if launchbox_id_from_tag is not None:
             log.debug(f"Found LaunchBox ID tag in filename: {launchbox_id_from_tag}")
@@ -161,7 +169,7 @@ class LaunchboxHandler(MetadataHandler):
 
             # Resolve MAME arcade filename (e.g. wrlok_l3.zip) to its full title
             # via LaunchBox's Mame.xml before name-based lookup.
-            if platform_slug == UPS.ARCADE:
+            if platform_slug in MAME_SHORTNAME_PLATFORMS:
                 mame_entry = await self._remote.get_mame_entry(fs_name)
                 if mame_entry:
                     name = (mame_entry.get("Name") or "").strip()

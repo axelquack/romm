@@ -1,98 +1,19 @@
 import { describe, expect, it } from "vitest";
 import type { Config } from "@/stores/config";
 import type { Heartbeat } from "@/stores/heartbeat";
-import type { SimpleRom } from "@/stores/roms";
+import { ejsCoresFixture } from "./ejsCores.fixtures";
 import {
-  getDownloadPath,
+  getSupportedEJSCores,
+  isArcadeSystem,
+  isEasyRpgEmulationSupported,
+  isEasyRpgGame,
   isJsDosBundle,
   isJsDosEmulationSupported,
+  isPico8EmulationSupported,
+  isPico8Rom,
+  languageToEmoji,
 } from "./index";
-
-function makeRom(overrides: Partial<SimpleRom>): SimpleRom {
-  return {
-    id: 1,
-    fs_name: "Game",
-    files: [],
-    ...overrides,
-  } as SimpleRom;
-}
-
-describe("getDownloadPath", () => {
-  it("uses fs_name for a flat single-file rom", () => {
-    const rom = makeRom({
-      id: 14,
-      fs_name: "Maniac Mansion (1989).adf",
-      has_nested_single_file: false,
-      files: [
-        { id: 19, file_name: "Maniac Mansion (1989).adf" },
-      ] as SimpleRom["files"],
-    });
-    expect(getDownloadPath({ rom })).toBe(
-      "/api/roms/14/content/Maniac Mansion (1989).adf",
-    );
-  });
-
-  it("uses the file name for a nested single-file rom", () => {
-    const rom = makeRom({
-      id: 21,
-      fs_name: "Art Of Fighting",
-      has_nested_single_file: true,
-      files: [{ id: 26, file_name: "aof.zip" }] as SimpleRom["files"],
-    });
-    expect(getDownloadPath({ rom })).toBe("/api/roms/21/content/aof.zip");
-  });
-
-  it("uses fs_name for an unselected multi-file rom", () => {
-    const rom = makeRom({
-      id: 24,
-      fs_name: "B.A.T.",
-      has_nested_single_file: false,
-      files: [
-        { id: 29, file_name: "B.A.T. Disk1.adf" },
-        { id: 30, file_name: "B.A.T. Disk2.adf" },
-      ] as SimpleRom["files"],
-    });
-    expect(getDownloadPath({ rom })).toBe("/api/roms/24/content/B.A.T.");
-  });
-
-  it("uses the selected file name (with extension) for a single file", () => {
-    // Multi-file rom: fs_name is the folder name with no extension. The URL
-    // path segment must carry the selected file's real name so the emulator
-    // receives a file with the correct extension.
-    const rom = makeRom({
-      id: 24,
-      fs_name: "B.A.T.",
-      files: [
-        { id: 29, file_name: "B.A.T. Disk1.adf" },
-        { id: 30, file_name: "B.A.T. Disk2.adf" },
-      ] as SimpleRom["files"],
-    });
-    expect(getDownloadPath({ rom, fileIDs: [29] })).toBe(
-      "/api/roms/24/content/B.A.T.%20Disk1.adf?file_ids=29",
-    );
-  });
-
-  it("falls back to fs_name when multiple files are selected (zip)", () => {
-    const rom = makeRom({
-      id: 24,
-      fs_name: "B.A.T.",
-      files: [
-        { id: 29, file_name: "B.A.T. Disk1.adf" },
-        { id: 30, file_name: "B.A.T. Disk2.adf" },
-      ] as SimpleRom["files"],
-    });
-    expect(getDownloadPath({ rom, fileIDs: [29, 30] })).toBe(
-      "/api/roms/24/content/B.A.T.?file_ids=29%2C30",
-    );
-  });
-
-  it("falls back to fs_name when the selected file id is unknown", () => {
-    const rom = makeRom({ id: 24, fs_name: "B.A.T." });
-    expect(getDownloadPath({ rom, fileIDs: [999] })).toBe(
-      "/api/roms/24/content/B.A.T.?file_ids=999",
-    );
-  });
-});
+import { romFixture } from "./rom.fixtures";
 
 function makeHeartbeat(
   emulation: Partial<Heartbeat["EMULATION"]> = {},
@@ -102,6 +23,9 @@ function makeHeartbeat(
       DISABLE_EMULATOR_JS: false,
       DISABLE_RUFFLE_RS: false,
       DISABLE_JSDOS: false,
+      DISABLE_PICO8: false,
+      DISABLE_EASYRPG: false,
+      ...ejsCoresFixture(),
       ...emulation,
     },
   } as Heartbeat;
@@ -148,7 +72,7 @@ describe("isJsDosEmulationSupported", () => {
 });
 
 describe("isJsDosBundle", () => {
-  const withExt = (fs_extension: string) => makeRom({ fs_extension });
+  const withExt = (fs_extension: string) => romFixture({ fs_extension });
 
   it("accepts a .jsdos bundle regardless of case", () => {
     expect(isJsDosBundle(withExt("jsdos"))).toBe(true);
@@ -165,5 +89,122 @@ describe("isJsDosBundle", () => {
   it("rejects a missing rom", () => {
     expect(isJsDosBundle(null)).toBe(false);
     expect(isJsDosBundle(undefined)).toBe(false);
+  });
+});
+
+describe("PICO-8 support", () => {
+  it("supports the pico platform and configured remaps", () => {
+    expect(isPico8EmulationSupported("pico", makeHeartbeat())).toBe(true);
+    expect(
+      isPico8EmulationSupported(
+        "custom-pico",
+        makeHeartbeat(),
+        makeConfig({ "custom-pico": "pico" }),
+      ),
+    ).toBe(true);
+    expect(isPico8EmulationSupported("snes", makeHeartbeat())).toBe(false);
+  });
+
+  it("respects the DISABLE_PICO8 admin toggle", () => {
+    expect(
+      isPico8EmulationSupported("pico", makeHeartbeat({ DISABLE_PICO8: true })),
+    ).toBe(false);
+  });
+
+  // A `.p8.png` cart lands with fs_extension "png", so the name is the only
+  // thing that identifies one.
+  it("accepts .p8 and .p8.png cartridges only", () => {
+    expect(
+      isPico8Rom(romFixture({ fs_name: "celeste.p8", fs_extension: "p8" })),
+    ).toBe(true);
+    expect(
+      isPico8Rom(
+        romFixture({ fs_name: "slipways.p8.png", fs_extension: "png" }),
+      ),
+    ).toBe(true);
+    expect(
+      isPico8Rom(
+        romFixture({ fs_name: "SLIPWAYS.P8.PNG", fs_extension: "PNG" }),
+      ),
+    ).toBe(true);
+    expect(
+      isPico8Rom(romFixture({ fs_name: "label.png", fs_extension: "png" })),
+    ).toBe(false);
+    expect(
+      isPico8Rom(romFixture({ fs_name: "game.zip", fs_extension: "zip" })),
+    ).toBe(false);
+    expect(isPico8Rom(null)).toBe(false);
+  });
+});
+
+describe("EasyRPG support", () => {
+  it("supports the rpg-maker platform and configured remaps", () => {
+    expect(isEasyRpgEmulationSupported("rpg-maker", makeHeartbeat())).toBe(
+      true,
+    );
+    expect(
+      isEasyRpgEmulationSupported(
+        "easyrpg",
+        makeHeartbeat(),
+        makeConfig({ easyrpg: "rpg-maker" }),
+      ),
+    ).toBe(true);
+    expect(isEasyRpgEmulationSupported("snes", makeHeartbeat())).toBe(false);
+  });
+
+  it("respects the DISABLE_EASYRPG admin toggle", () => {
+    expect(
+      isEasyRpgEmulationSupported(
+        "rpg-maker",
+        makeHeartbeat({ DISABLE_EASYRPG: true }),
+      ),
+    ).toBe(false);
+  });
+
+  it("follows the backend's game folder check", () => {
+    expect(isEasyRpgGame(romFixture({ is_easyrpg_game: true }))).toBe(true);
+    expect(isEasyRpgGame(romFixture({ is_easyrpg_game: false }))).toBe(false);
+    expect(isEasyRpgGame(null)).toBe(false);
+  });
+});
+
+describe("getSupportedEJSCores", () => {
+  const maps = ejsCoresFixture();
+
+  it("reads the platform's cores from the served map, in any case", () => {
+    expect(getSupportedEJSCores("PSX", maps)).toEqual([
+      "pcsx_rearmed",
+      "mednafen_psx_hw",
+    ]);
+  });
+
+  it("layers the nightly cores on when netplay is on", () => {
+    expect(getSupportedEJSCores("snes", maps)).toEqual(["snes9x"]);
+    expect(getSupportedEJSCores("snes", maps, true)).toEqual([
+      "snes9x",
+      "bsnes",
+    ]);
+    expect(getSupportedEJSCores("3ds", maps)).toEqual([]);
+    expect(getSupportedEJSCores("3ds", maps, true)).toEqual(["azahar"]);
+  });
+
+  it("offers no core for a platform the map leaves out", () => {
+    expect(getSupportedEJSCores("naomi", maps)).toEqual([]);
+  });
+});
+
+describe("arcade platforms", () => {
+  it("treats every arcade board as arcade hardware", () => {
+    expect(isArcadeSystem("naomi")).toBe(true);
+    expect(isArcadeSystem("model2")).toBe(true);
+    expect(isArcadeSystem("snes")).toBe(false);
+  });
+});
+
+describe("languageToEmoji", () => {
+  it("tells Brazilian from European Portuguese", () => {
+    expect(languageToEmoji("Brazilian Portuguese")).toBe("🇧🇷");
+    expect(languageToEmoji("pt-BR")).toBe("🇧🇷");
+    expect(languageToEmoji("Portuguese")).toBe("🇵🇹");
   });
 });
