@@ -123,7 +123,9 @@
       "@vitest/browser": "$vitest",
       "@vitest/runner": "$vitest",
       "@vitest/browser-playwright": "$@vitest/browser-playwright"
-    }
+    },
+    "follow-redirects": "1.16.2",
+    "fast-uri": "3.1.9"
   },
   "engines": {
     "node": "26",
