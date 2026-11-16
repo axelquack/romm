@@ -15,6 +15,7 @@ export type MetadataOption = {
 const defaultHeartbeat: Heartbeat = {
   SYSTEM: {
     VERSION: "0.0.0",
+    GIT_BRANCH: null,
     SHOW_SETUP_WIZARD: false,
   },
   METADATA_SOURCES: {
@@ -34,15 +35,22 @@ const defaultHeartbeat: Heartbeat = {
     DEMOZOO_API_ENABLED: false,
     POUET_API_ENABLED: false,
     CSDB_API_ENABLED: false,
+    STEAM_API_ENABLED: false,
     LIBRETRO_API_ENABLED: false,
   },
   FILESYSTEM: {
     FS_PLATFORMS: [],
+    FS_PLATFORM_SLUGS: {},
+    TITLE_ID_EXTRACTION_ENABLED: false,
   },
   EMULATION: {
     DISABLE_EMULATOR_JS: false,
     DISABLE_RUFFLE_RS: false,
     DISABLE_JSDOS: false,
+    DISABLE_PICO8: false,
+    DISABLE_EASYRPG: false,
+    EJS_CORES: {},
+    EJS_NIGHTLY_CORES: {},
   },
   FRONTEND: {
     DISABLE_USERPASS_LOGIN: false,
@@ -54,6 +62,24 @@ const defaultHeartbeat: Heartbeat = {
     AUTOLOGIN: false,
     PROVIDER: "",
     RP_INITIATED_LOGOUT: false,
+  },
+  NOTIFICATIONS: {
+    EMAIL_ENABLED: false,
+    EMAILS_RESET_LINKS: false,
+  },
+  DEVICE_INSTALL: {
+    ENABLED: false,
+    EXCLUDED_PLATFORM_SLUGS: [],
+  },
+  CONVERTO: {
+    ENABLED: false,
+  },
+  SAVE_SYNC: {
+    SNAPSHOT_RETENTION: 10,
+    SNAPSHOT_BRANCH_LIFETIME_DAYS: 30,
+  },
+  ROM_PATCHER: {
+    SUPPORTED_EXTENSIONS: [],
   },
   TASKS: {
     ENABLE_SCHEDULED_RESCAN: false,
@@ -183,7 +209,7 @@ export default defineStore("heartbeat", {
             : "",
         },
         {
-          name: "Flashpoint Project",
+          name: "Flashpoint",
           value: "flashpoint",
           logo_path: "/assets/scrappers/flashpoint.png",
           disabled: !this.value.METADATA_SOURCES?.FLASHPOINT_API_ENABLED
@@ -219,6 +245,14 @@ export default defineStore("heartbeat", {
           value: "csdb",
           logo_path: "/assets/scrappers/csdb.png",
           disabled: !this.value.METADATA_SOURCES?.CSDB_API_ENABLED
+            ? i18n.global.t("scan.disabled-by-admin")
+            : "",
+        },
+        {
+          name: "Steam",
+          value: "steam",
+          logo_path: "/assets/scrappers/steam.png",
+          disabled: !this.value.METADATA_SOURCES?.STEAM_API_ENABLED
             ? i18n.global.t("scan.disabled-by-admin")
             : "",
         },

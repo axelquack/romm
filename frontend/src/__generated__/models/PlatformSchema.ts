@@ -26,6 +26,7 @@ export type PlatformSchema = {
     flashpoint_id?: (number | null);
     category?: (string | null);
     generation?: (number | null);
+    first_release_year?: (number | null);
     family_name?: (string | null);
     family_slug?: (string | null);
     url?: (string | null);
@@ -38,6 +39,8 @@ export type PlatformSchema = {
     is_identified: boolean;
     missing_from_fs: boolean;
     readonly display_name: string;
+    readonly abbreviation: string;
+    readonly alternative_names: Array<string>;
     readonly firmware_count: number;
 };
 

@@ -4,17 +4,19 @@ import enum
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Final
 
-from sqlalchemy import TIMESTAMP, Enum, ForeignKey, String
+from sqlalchemy import TIMESTAMP, Boolean, Enum, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from starlette.authentication import SimpleUser
 
+from config import OIDC_ENABLED
 from handler.auth.constants import Scope
 from models.base import BaseModel
 from models.permission import PermissionGroup
-from utils.database import CustomJSON
+from utils.database import CustomJSON, ExactString
+from utils.datetime import older_than
 
 if TYPE_CHECKING:
-    from models.assets import Save, Screenshot, State
+    from models.assets import MemoryCard, Save, Screenshot, State
     from models.client_token import ClientToken
     from models.collection import Collection, SmartCollection
     from models.device import Device
@@ -47,7 +49,10 @@ KIOSK_USER_ID: Final = -1
 
 class User(BaseModel, SimpleUser):
     __tablename__ = "users"
-    __table_args__ = {"extend_existing": True}
+    __table_args__ = (
+        Index("ix_users_oidc_identity", "oidc_issuer", "oidc_sub", unique=True),
+        {"extend_existing": True},
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
@@ -60,6 +65,10 @@ class User(BaseModel, SimpleUser):
     email: Mapped[str | None] = mapped_column(
         String(length=TEXT_FIELD_LENGTH), unique=True, index=True
     )
+    # The provider's `iss` and `sub` claims: a stable identity that survives an
+    # email change. Exact, since a `sub` is case-sensitive.
+    oidc_issuer: Mapped[str | None] = mapped_column(ExactString(TEXT_FIELD_LENGTH))
+    oidc_sub: Mapped[str | None] = mapped_column(ExactString(TEXT_FIELD_LENGTH))
     enabled: Mapped[bool] = mapped_column(default=True)
     # VARCHAR-backed (native_enum=False) storing the lowercase value, so the
     # vocabulary stays portable across SQLite/MariaDB/Postgres.
@@ -79,6 +88,9 @@ class User(BaseModel, SimpleUser):
         nullable=True,
         index=True,
     )
+    # Per-user replacements for the group's age limit settings; NULL inherits.
+    age_limit: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    hide_unrated_roms: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     avatar_path: Mapped[str] = mapped_column(
         String(length=TEXT_FIELD_LENGTH), default=""
     )
@@ -96,6 +108,9 @@ class User(BaseModel, SimpleUser):
 
     saves: Mapped[list[Save]] = relationship(lazy="raise", back_populates="user")
     states: Mapped[list[State]] = relationship(lazy="raise", back_populates="user")
+    memory_cards: Mapped[list[MemoryCard]] = relationship(
+        lazy="raise", back_populates="user"
+    )
     screenshots: Mapped[list[Screenshot]] = relationship(
         lazy="raise", back_populates="user"
     )
@@ -154,13 +169,25 @@ class User(BaseModel, SimpleUser):
         return compute_oauth_scopes(self)
 
     @property
-    def fs_safe_folder_name(self):
+    def has_password(self) -> bool:
+        """Whether the account can sign in with a password: OIDC-provisioned
+        accounts hold a random placeholder instead of a bcrypt hash."""
+        return bool(self.hashed_password and self.hashed_password.startswith("$2"))
+
+    @property
+    def email_managed_by_oidc(self) -> bool:
+        """Whether the provider owns the email: it overwrites a linked account's
+        at every sign-in, and finds an unlinked password-less account by it."""
+        return OIDC_ENABLED and (self.oidc_sub is not None or not self.has_password)
+
+    @property
+    def fs_safe_folder_name(self) -> str:
         # Uses the ID to avoid issues with username changes
         return f"User:{self.id}".encode().hex()
 
-    def set_last_active(self):
+    def set_last_active(self) -> None:
         from handler.database import db_user_handler
+        from handler.database.users_handler import LAST_ACTIVE_DEBOUNCE
 
-        db_user_handler.update_user(
-            self.id, {"last_active": datetime.now(timezone.utc)}
-        )
+        if older_than(self.last_active, LAST_ACTIVE_DEBOUNCE):
+            db_user_handler.update_last_active(self.id)

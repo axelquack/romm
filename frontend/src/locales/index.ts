@@ -16,12 +16,23 @@ const modulesByLocale = new Map<
   Map<string, () => Promise<LocaleModule>>
 >();
 for (const [path, load] of Object.entries(localeModules)) {
-  const matched = path.match(/\.\/([A-Za-z0-9-_]+)\/([A-Za-z0-9-_]+)\.json$/i);
-  if (!matched) continue;
+  const [, locale, namespace] =
+    path.match(/\.\/([A-Za-z0-9-_]+)\/([A-Za-z0-9-_]+)\.json$/i) ?? [];
+  if (!locale || !namespace) continue;
 
-  const [, locale, namespace] = matched;
   if (!modulesByLocale.has(locale)) modulesByLocale.set(locale, new Map());
   modulesByLocale.get(locale)?.set(namespace, load);
+}
+
+export const availableLocales: readonly string[] = [...modulesByLocale.keys()];
+
+// Czech strings carry either "zero | one | 2-4 | 5+" forms or just
+// "one | other"; vue-i18n indexes the segments without bounds checks.
+export function czechPluralIndex(choice: number, choicesLength: number) {
+  if (choicesLength === 2) return choice === 1 ? 0 : 1;
+  if (choice === 0) return 0;
+  if (choice === 1) return 1;
+  return choice >= 2 && choice <= 4 ? 2 : 3;
 }
 
 const i18n = createI18n({
@@ -29,14 +40,27 @@ const i18n = createI18n({
   locale: FALLBACK_LOCALE,
   fallbackLocale: FALLBACK_LOCALE,
   messages: {},
-  pluralRules: {
-    cs_CZ(choice: number) {
-      if (choice === 0) return 0;
-      if (choice === 1) return 1;
-      return choice >= 2 && choice <= 4 ? 2 : 3;
-    },
-  },
+  pluralRules: { cs_CZ: czechPluralIndex },
 });
+
+// Picks the first available locale matching the browser's preferences, exact
+// region first ("en-GB" -> "en_GB"), then language only ("fr" -> "fr_FR").
+export function matchPreferredLocale(
+  preferred: readonly string[],
+  available: readonly string[],
+): string | undefined {
+  for (const pref of preferred) {
+    const normalized = pref.replaceAll("-", "_").toLowerCase();
+    const exact = available.find((l) => l.toLowerCase() === normalized);
+    if (exact) return exact;
+    const base = normalized.split("_")[0];
+    const partial = available.find(
+      (l) => l.toLowerCase().split("_")[0] === base,
+    );
+    if (partial) return partial;
+  }
+  return undefined;
+}
 
 const pendingLocales = new Map<string, Promise<void>>();
 
@@ -83,7 +107,13 @@ export function loadLocale(locale: string): Promise<void> {
 // write the raw key to the tab. Other languages load when switched to.
 export const localesReady = Promise.all([
   loadLocale(FALLBACK_LOCALE),
-  loadLocale(localStorage.getItem(STORED_LOCALE_KEY) ?? FALLBACK_LOCALE),
+  loadLocale(
+    // Read at module load, before anyone is signed in.
+    // eslint-disable-next-line romm/no-unscoped-local-storage
+    localStorage.getItem(STORED_LOCALE_KEY) ||
+      matchPreferredLocale(navigator.languages, availableLocales) ||
+      FALLBACK_LOCALE,
+  ),
 ]);
 
 watch(i18n.global.locale, (locale) => {

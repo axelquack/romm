@@ -3,6 +3,7 @@ import enum
 import http
 import json
 import re
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, fields
@@ -15,7 +16,16 @@ import yarl
 from aiohttp.client import ClientTimeout
 from fastapi import HTTPException, status
 
-from adapters.services.screenscraper_types import SSGame, SSUser
+from adapters.services.provider_http import send_with_retries
+from adapters.services.response_validation import parse_response
+from adapters.services.screenscraper_types import (
+    SSGame,
+    SSGameInfoResult,
+    SSResponse,
+    SSResult,
+    SSSearchResult,
+    SSUser,
+)
 from config import (
     SCAN_WORKERS,
     SCREENSCRAPER_DEV_ID,
@@ -40,17 +50,18 @@ LOGIN_ERROR_CHECK: Final = "Erreur de login"
 _INVALID_ESCAPE_RE: Final = re.compile(r'\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})')
 
 
-def _loads_lenient(text: str) -> dict:
-    """Parse a ScreenScraper JSON payload, repairing invalid escapes on failure.
+def _parse_lenient[T](tp: type[T], text: str, *, source: str) -> T | None:
+    """Parse a ScreenScraper reply, repairing invalid escapes on failure.
 
     A single unescaped backslash would otherwise sink an entire response (and thus
     the match), so on a decode error we double any backslash that isn't a valid
     JSON escape and try once more.
     """
     try:
-        return json.loads(text)
+        return parse_response(tp, text, source=source)
     except json.JSONDecodeError:
-        return json.loads(_INVALID_ESCAPE_RE.sub(r"\\\\", text))
+        repaired = _INVALID_ESCAPE_RE.sub(r"\\\\", text)
+        return parse_response(tp, repaired, source=source)
 
 
 # ScreenScraper enforces a per-account *thread* (concurrency) cap. Because a
@@ -69,6 +80,22 @@ _rate_limiter = RateLimiter(SS_UNPACED_REQUESTS_PER_SECOND)
 
 # How close to either daily allowance the account has to be before we warn.
 SS_LOW_QUOTA_FRACTION: Final[float] = 0.1
+
+# ScreenScraper answers 430 for reasons that do not always survive a retry, so the
+# scrape allowance is refused this many times before the provider is taken out.
+SS_QUOTA_TRIP_THRESHOLD: Final[int] = 2
+
+# How often an armed breaker re-checks the account. The check is opportunistic,
+# hence the short timeout.
+SS_QUOTA_RECHECK_SECONDS: Final[int] = 60
+SS_QUOTA_RECHECK_TIMEOUT: Final[int] = 30
+
+# Whose allowance was spent is left open on purpose: a refused password gets the
+# request charged at the unauthenticated one.
+SS_QUOTA_EXHAUSTED_DETAIL: Final[str] = (
+    "ScreenScraper refused the request: the daily scrape quota for the configured "
+    "credentials is spent. ScreenScraper resets its quotas at midnight CET."
+)
 
 # Media downloads are served at the account's advertised speed, so their timeout
 # is derived from how long a large file (a manual, a video) takes at that speed,
@@ -192,13 +219,20 @@ class _ScanState:
     # a scan so the next scan can report them again.
     logged_worker_advisory: bool = False
     logged_low_quota_warning: bool = False
+    logged_low_ko_quota_notice: bool = False
+    logged_submission_limit_notice: bool = False
+    logged_quota_refusal_notice: bool = False
 
-    # ScreenScraper enforces a *daily* request quota (HTTP 430/431) separate from
-    # the transient rate limit (HTTP 429). The daily quota only resets the next
-    # day, so once it's hit there's nothing to wait for within a scan. Trip a
-    # breaker on the first daily-quota error so the remaining requests
-    # short-circuit instead of hammering a dead quota.
+    # ScreenScraper enforces a daily *scrape* allowance (HTTP 430) separate from
+    # the transient rate limit (HTTP 429). Once it is spent every remaining ROM
+    # costs a round trip to be told so, so the rest short-circuit instead.
+    daily_quota_errors: int = 0
     daily_quota_exhausted: bool = False
+    quota_recheck_at: float | None = None
+
+    # Stamps each counted refusal so the ones already in flight when it was
+    # counted are recognized as the same wall rather than as fresh evidence.
+    quota_generation: int = 0
 
     # A refused credential set (HTTP 403) is refused for every request that
     # follows, so it trips a breaker of its own rather than costing a round trip
@@ -215,8 +249,10 @@ _state = _ScanState()
 
 
 def reset_daily_quota() -> None:
-    """Clear the daily-quota breaker so the next scan re-evaluates the quota."""
+    """Clear the daily-quota breaker and the refusals that would re-arm it."""
+    _state.daily_quota_errors = 0
     _state.daily_quota_exhausted = False
+    _state.quota_recheck_at = None
 
 
 def is_daily_quota_exhausted() -> bool:
@@ -224,15 +260,52 @@ def is_daily_quota_exhausted() -> bool:
     return _state.daily_quota_exhausted
 
 
-def _trip_daily_quota(reason: str) -> None:
-    """Trip the daily-quota breaker, logging a single clear notice the first time."""
-    if not _state.daily_quota_exhausted:
-        log.warning(
-            "ScreenScraper %s; skipping ScreenScraper for the rest of this scan "
-            "(quotas reset at midnight CET)",
-            reason,
-        )
+def is_breaker_tripped() -> bool:
+    """Whether a breaker has taken ScreenScraper out for the rest of this scan."""
+    return _state.daily_quota_exhausted or _state.credentials_rejected is not None
+
+
+def _count_daily_quota_error(generation: int) -> None:
+    """Count a refused scrape allowance, arming the breaker at the threshold.
+
+    Args:
+        generation: the generation the refused request was sent under; refusals
+            counted under a stale one are the same wall seen twice.
+    """
+    if _state.daily_quota_exhausted or generation != _state.quota_generation:
+        return
+
+    _state.quota_generation += 1
+    _state.daily_quota_errors += 1
+    if _state.daily_quota_errors < SS_QUOTA_TRIP_THRESHOLD:
+        # A response clears the count, so refusals that keep not surviving a retry
+        # would otherwise say this on every one of them.
+        if not _state.logged_quota_refusal_notice:
+            _state.logged_quota_refusal_notice = True
+            log.warning("ScreenScraper refused a request for the daily scrape quota")
+        return
+
     _state.daily_quota_exhausted = True
+    _state.quota_recheck_at = time.monotonic() + SS_QUOTA_RECHECK_SECONDS
+    log.warning(
+        "ScreenScraper refused %d requests for the daily scrape quota; pausing "
+        "ScreenScraper and re-checking the account every %d seconds",
+        _state.daily_quota_errors,
+        SS_QUOTA_RECHECK_SECONDS,
+    )
+
+
+def _note_submission_limit() -> None:
+    """Report the lost contribution once: it costs no metadata."""
+    if _state.logged_submission_limit_notice:
+        return
+
+    _state.logged_submission_limit_notice = True
+    log.info(
+        "ScreenScraper's daily limit for submitting unknown ROMs has been reached, "
+        "so unmatched ROMs will not be proposed for review for the rest of today. "
+        "Scraping is unaffected"
+    )
 
 
 def _error_message(body: str) -> str:
@@ -276,11 +349,16 @@ def _reject_credentials(url: str, message: str = "") -> ScreenScraperCredentials
     return error
 
 
-def _handle_client_error(url: str, err: aiohttp.ClientResponseError) -> dict:
+def _handle_client_error(
+    url: str, err: aiohttp.ClientResponseError, generation: int
+) -> None:
     """Map one of ScreenScraper's documented statuses onto a clear error.
 
-    Returns an empty response for the ones a scan can carry on through, and
-    raises for the ones a caller has to hear about.
+    Returns None for the ones a scan can carry on through, and raises for the
+    ones a caller has to hear about.
+
+    Args:
+        generation: the quota generation the refused request was sent under.
     """
     if err.status == http.HTTPStatus.FORBIDDEN:
         raise _reject_credentials(url) from err
@@ -291,7 +369,7 @@ def _handle_client_error(url: str, err: aiohttp.ClientResponseError) -> dict:
             "ScreenScraper closed the API to non-members and inactive members; "
             "it gives server saturation (CPU >60%) as the cause"
         )
-        return {}
+        return None
     elif err.status == 423:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -303,20 +381,19 @@ def _handle_client_error(url: str, err: aiohttp.ClientResponseError) -> dict:
             detail="ScreenScraper has blacklisted this application version. Please update RomM.",
         ) from err
     elif err.status == 430:
-        _trip_daily_quota("daily scrape quota exhausted")
+        _count_daily_quota_error(generation)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="ScreenScraper daily scrape quota exhausted. It resets at midnight CET.",
+            detail=SS_QUOTA_EXHAUSTED_DETAIL,
         ) from err
     elif err.status == 431:
-        _trip_daily_quota("daily unrecognized-ROM quota exhausted")
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="ScreenScraper daily unrecognized-ROM quota exhausted. It resets at midnight CET.",
-        ) from err
+        # This ROM did not match *and* the account has proposed its daily maximum
+        # of unknown ROMs for review. Only the first half concerns the scan.
+        _note_submission_limit()
+        return None
 
     log.error(err)
-    return {}
+    return None
 
 
 def reset_scan_state() -> None:
@@ -344,7 +421,7 @@ def _parse_ss_int(value: object, *, minimum: int = 0) -> int | None:
     """Read one of the account's numeric fields, ignoring absent or junk values."""
     try:
         parsed = int(str(value))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
     return parsed if parsed >= minimum else None
@@ -428,48 +505,56 @@ def _log_worker_advisory(max_threads: int | None) -> None:
         )
 
 
-def _warn_on_low_quota(limits: SSAccountLimits) -> None:
-    """Warn before a daily allowance runs out, rather than after it is refused."""
-    if _state.logged_low_quota_warning:
-        return
+def _is_low(remaining: int | None, allowance: int | None) -> bool:
+    """Whether a daily allowance is close enough to spent to be worth saying."""
+    if remaining is None or allowance is None:
+        return False
 
-    for remaining, allowance, label in (
-        (limits.remaining_requests, limits.max_requests_per_day, "requests"),
-        (
+    return remaining <= allowance * SS_LOW_QUOTA_FRACTION
+
+
+def _warn_on_low_quota(limits: SSAccountLimits) -> None:
+    """Flag a daily allowance running out, rather than waiting for the refusal.
+
+    Each allowance gets its own one-shot, so the much smaller submission quota
+    does not consume the scrape quota's advisory.
+    """
+    if not _state.logged_low_quota_warning and _is_low(
+        limits.remaining_requests, limits.max_requests_per_day
+    ):
+        _state.logged_low_quota_warning = True
+        log.warning(
+            "ScreenScraper: only %d of %d daily requests left, "
+            "the quota resets at midnight CET",
+            limits.remaining_requests,
+            limits.max_requests_per_day,
+        )
+
+    # Running out of this one costs a contribution, not any metadata.
+    if not _state.logged_low_ko_quota_notice and _is_low(
+        limits.remaining_ko_requests, limits.max_ko_requests_per_day
+    ):
+        _state.logged_low_ko_quota_notice = True
+        log.info(
+            "ScreenScraper: only %d of %d daily unrecognized-ROM submissions left, "
+            "the quota resets at midnight CET",
             limits.remaining_ko_requests,
             limits.max_ko_requests_per_day,
-            "unrecognized-ROM requests",
-        ),
-    ):
-        if remaining is None or allowance is None:
-            continue
-
-        if remaining <= allowance * SS_LOW_QUOTA_FRACTION:
-            log.warning(
-                "ScreenScraper: only %d of %d daily %s left, "
-                "the quota resets at midnight CET",
-                remaining,
-                allowance,
-                label,
-            )
-            _state.logged_low_quota_warning = True
-            return
+        )
 
 
-def _update_account_limits(response: dict) -> None:
+def _update_account_limits(response: object) -> None:
     """Read the account allowances ScreenScraper attaches to every response.
 
     They govern how fast we may scrape (threads and requests per minute), how
     much of the daily quota is left, and how slowly media will download.
     """
-    payload = response.get("response")
-    if not isinstance(payload, dict):
-        return
-
-    ssuser = payload.get("ssuser")
+    payload = response.get("response") if isinstance(response, dict) else None
+    ssuser = payload.get("ssuser") if isinstance(payload, dict) else None
     if not isinstance(ssuser, dict):
         return
 
+    # Checked against SSUser with the rest of the reply, since SSResult declares it.
     limits = _read_account_limits(cast(SSUser, ssuser))
     _state.account_limits = limits
 
@@ -556,6 +641,8 @@ async def prime_account_limits() -> SSAccountLimits | None:
         # Already reported in full, so say only why no quota follows.
         reason = "credentials rejected"
     except HTTPException as exc:
+        # The check reports; only a request a scan needs may take the provider out.
+        reset_daily_quota()
         reason = str(exc.detail)
     except (TimeoutError, aiohttp.ClientError) as exc:
         reason = str(exc)
@@ -599,7 +686,9 @@ class ScreenScraperService:
     ) -> None:
         self.url = yarl.URL(base_url or "https://api.screenscraper.fr/api2")
 
-    async def _attempt_request(self, url: str, request_timeout: int) -> dict:
+    async def _attempt_request[T](
+        self, url: str, tp: type[T], request_timeout: int
+    ) -> T | None:
         """Make one request, and read the account allowances riding along on it.
 
         A refusal explains itself in the body, so the body is read before the
@@ -632,55 +721,94 @@ class ScreenScraperService:
                     raise _reject_credentials(url, _error_message(res_text)) from err
                 raise
 
-            data = await res.json(loads=_loads_lenient)
-
-        _update_account_limits(data)
-        return data
-
-    async def _request(self, url: str, request_timeout: int = 120) -> dict:
-        # Daily quota already exhausted earlier in this scan: skip the request but
-        # still raise the quota error so callers (e.g. manual search) surface a
-        # clear message. The scan loop catches this and falls back to the other
-        # providers instead of hitting a dead quota for every remaining ROM.
-        if _state.daily_quota_exhausted:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="ScreenScraper daily quota exhausted. It resets at midnight CET.",
+            response = _parse_lenient(
+                tp, res_text, source=f"ScreenScraper {yarl.URL(url).name}"
             )
 
+        # A response means the wall the counter was tracking is not there.
+        _state.daily_quota_errors = 0
+        _update_account_limits(response)
+        return response
+
+    async def _recheck_daily_quota(self) -> bool:
+        """Ask the free account endpoint whether the scrape allowance is back.
+
+        Returns:
+            True when the breaker was cleared and the caller may proceed.
+        """
+        now = time.monotonic()
+        if _state.quota_recheck_at is None or now < _state.quota_recheck_at:
+            return False
+
+        # Claiming the next check before the first await keeps concurrent callers
+        # from probing at once: read-then-write with no await is atomic here.
+        _state.quota_recheck_at = now + SS_QUOTA_RECHECK_SECONDS
+
+        url = str(self.url.joinpath("ssuserInfos.php"))
+        credentials_before = _state.credentials_rejected
+        limits_before = _state.account_limits
+        try:
+            # _attempt_request rather than _request, to bypass the breaker being
+            # checked. wait_for bounds the wait for a concurrency slot too, which
+            # a media download can hold for minutes.
+            await asyncio.wait_for(
+                self._attempt_request(
+                    url, SSResponse[SSResult], SS_QUOTA_RECHECK_TIMEOUT
+                ),
+                SS_QUOTA_RECHECK_TIMEOUT,
+            )
+        except (
+            HTTPException,
+            TimeoutError,
+            aiohttp.ClientError,
+            json.JSONDecodeError,
+        ) as exc:
+            # Restored because nothing outside a scan clears the credentials
+            # breaker, so a 403 here would take the provider out for good.
+            _state.credentials_rejected = credentials_before
+            log.debug("ScreenScraper: could not re-check the daily quota (%s)", exc)
+            return False
+
+        # Only a reading this probe brought back is evidence: the pre-wall limits
+        # still show the headroom the account had before it ran out.
+        limits = _state.account_limits
+        remaining = limits.remaining_requests if limits is not None else None
+        if limits is limits_before or not remaining:
+            return False
+
+        log.info("ScreenScraper: the daily scrape quota is available again, resuming")
+        reset_daily_quota()
+        return True
+
+    async def _request[T](
+        self, url: str, tp: type[T], request_timeout: int = 120
+    ) -> T | None:
         # Credentials already refused: the answer will not change until they are
-        # corrected, which takes a restart to pick up.
+        # corrected, which takes a restart to pick up. Checked ahead of the quota
+        # so a re-check never spends a request on credentials already refused.
         if _state.credentials_rejected:
             raise ScreenScraperCredentialsError(_state.credentials_rejected)
 
-        try:
-            return await self._attempt_request(url, request_timeout)
-        except aiohttp.ServerTimeoutError:
-            # Retry the request once if it times out
-            pass
-        except aiohttp.ClientConnectionError as exc:
-            log.critical(
-                "Connection error: can't connect to ScreenScraper", exc_info=True
-            )
+        # Scrape allowance already spent: skip the request but still raise, so
+        # callers (e.g. manual search) get a clear message rather than a miss.
+        if _state.daily_quota_exhausted and not await self._recheck_daily_quota():
             raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Can't connect to ScreenScraper, check your internet connection",
-            ) from exc
-        except aiohttp.ClientResponseError as err:
-            if err.status != http.HTTPStatus.TOO_MANY_REQUESTS:
-                return _handle_client_error(url, err)
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=SS_QUOTA_EXHAUSTED_DETAIL,
+            )
 
-            log.warning("ScreenScraper: rate limit hit, retrying after 2s")
-            await asyncio.sleep(2)
-        except json.JSONDecodeError as exc:
-            log.error("Error decoding JSON response from ScreenScraper: %s", exc)
-            return {}
+        generation = _state.quota_generation
+
+        async def send() -> T | None:
+            nonlocal generation
+            generation = _state.quota_generation
+            return await self._attempt_request(url, tp, request_timeout)
 
         try:
-            return await self._attempt_request(url, request_timeout)
-        except aiohttp.ServerTimeoutError as err:
-            log.error(err)
-            return {}
+            return await send_with_retries(send, provider="ScreenScraper", url=url)
+        except TimeoutError as err:
+            log.error("Request to URL=%s timed out again: %s", url, err)
+            return None
         except aiohttp.ClientResponseError as err:
             if err.status == http.HTTPStatus.TOO_MANY_REQUESTS:
                 # The pacing is behind the account's  per-minute budget.
@@ -688,26 +816,27 @@ class ScreenScraperService:
                 # of quietly saved without our metadata.
                 raise ScreenScraperRateLimitError() from err
 
-            return _handle_client_error(url, err)
+            _handle_client_error(url, err, generation)
+            return None
         except json.JSONDecodeError as exc:
             log.error("Error decoding JSON response from ScreenScraper: %s", exc)
-            return {}
+            return None
 
-    async def get_user_info(self) -> dict:
+    async def get_user_info(self) -> SSResponse[SSResult] | None:
         """Retrieve the account's allowances and quota counters.
 
         Reference: https://api.screenscraper.fr/webapi2.php#ssuserInfos
         """
         url = self.url.joinpath("ssuserInfos.php")
-        return await self._request(str(url))
+        return await self._request(str(url), SSResponse[SSResult])
 
-    async def get_infra_info(self) -> dict:
+    async def get_infra_info(self) -> SSResponse[SSResult] | None:
         """Retrieve information about the infrastructure.
 
         Reference: https://api.screenscraper.fr/webapi2.php#infraInfos
         """
         url = self.url.joinpath("ssinfraInfos.php")
-        return await self._request(str(url))
+        return await self._request(str(url), SSResponse[SSResult])
 
     async def get_game_info(
         self,
@@ -747,11 +876,9 @@ class ScreenScraperService:
             params["gameid"] = [str(game_id)]
 
         url = self.url.joinpath("jeuInfos.php").with_query(**params)
-        response = await self._request(str(url))
-        data = response.get("response", {}).get("jeu", {})
-        if not data:
-            return None
-        return cast(SSGame, data)
+        response = await self._request(str(url), SSResponse[SSGameInfoResult])
+        payload = response.get("response") if response else None
+        return (payload.get("jeu") or None) if isinstance(payload, dict) else None
 
     async def search_games(
         self,
@@ -768,9 +895,8 @@ class ScreenScraperService:
             params["systemeid"] = [str(system_id)]
 
         url = self.url.joinpath("jeuRecherche.php").with_query(**params)
-        response = await self._request(str(url))
-        data = response.get("response", {}).get("jeux", [])
-        # If no roms are returned, "jeux" is a list with an empty dict.
-        if len(data) == 1 and not data[0]:
-            data = []
-        return cast(list[SSGame], data)
+        response = await self._request(str(url), SSResponse[SSSearchResult])
+        payload = response.get("response") if response else None
+        games = (payload.get("jeux") or []) if isinstance(payload, dict) else []
+        # A reply kept as sent (see parse_response) still holds the placeholder.
+        return [game for game in games if game]

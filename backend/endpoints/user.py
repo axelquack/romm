@@ -1,5 +1,6 @@
+import asyncio
 import json
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Final
 
 from fastapi import Body, Form, HTTPException
 from fastapi import Path as PathVar
@@ -10,17 +11,35 @@ from decorators.auth import protected_route
 from endpoints.forms.identity import UserForm
 from endpoints.permissions import emit_permissions_changed
 from endpoints.responses.identity import InviteLinkSchema, UserSchema
-from handler.auth import auth_handler
+from exceptions.database_exceptions import LastAdminError
+from handler.audit_handler import (
+    AuditActor,
+    AuditTarget,
+    change,
+    changed_fields,
+    client_ip,
+    record,
+)
+from handler.auth.base_handler import auth_handler
 from handler.auth.constants import Scope
-from handler.database import db_user_handler
+from handler.auth.dependencies import assert_admin_for_admin
+from handler.database import (
+    db_client_token_handler,
+    db_device_handler,
+    db_user_handler,
+)
+from handler.device_install import device_install_handler
 from handler.filesystem import fs_asset_handler
 from handler.filesystem.assets_handler import (
     build_asset_file_response,
     validate_image_upload,
 )
-from handler.metadata import meta_ra_handler
-from handler.metadata.ra_handler import RAUserProgression
+from handler.notification_handler import notify
+from handler.play_session_handler import queue_ra_progress_sync
+from handler.socket_handler import close_client_token_sockets
 from logger.logger import log
+from models.audit_event import AuditAction
+from models.notification import NotificationKind, NotificationLevel
 from models.user import Role, User
 from utils.router import APIRouter
 from utils.validation import (
@@ -34,6 +53,82 @@ router = APIRouter(
     prefix="/users",
     tags=["users"],
 )
+
+
+# What a user edit reports; ui_settings and avatars change too often to be news.
+_USER_EDIT_AUDIT_FIELDS: Final = (
+    "username",
+    "email",
+    "hashed_password",
+    "role",
+    "enabled",
+)
+
+
+def _record_user_edit(
+    request: Request, before: User, after: User, cleaned_data: dict[str, Any]
+) -> None:
+    changed = changed_fields(
+        before, after, [f for f in _USER_EDIT_AUDIT_FIELDS if f in cleaned_data]
+    )
+    if not changed:
+        return
+    data: dict[str, Any] = {
+        "changed": ["password" if f == "hashed_password" else f for f in changed]
+    }
+    for field in ("username", "role", "enabled"):
+        if field in changed:
+            data[field] = change(before, after, field)
+    record(AuditAction.USER_EDIT, request, AuditTarget.of_user(after), data)
+
+
+async def _submitted_value(
+    request: Request, name: str, parsed: str | None
+) -> str | None:
+    """Return a form-model field, keeping a submitted "" the model reads as absent."""
+    if parsed is None and (await request.form()).get(name) == "":
+        return ""
+    return parsed
+
+
+async def _verify_account_holder(
+    request: Request, db_user: User, current_password: str | None
+) -> None:
+    """Require password or session proof for sensitive self-edits."""
+    if db_user.has_password:
+        if not current_password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Your current password is required to change your username, password or email",
+            )
+        # bcrypt takes ~250ms, which would stall the event loop.
+        if not await asyncio.to_thread(
+            auth_handler.verify_password, current_password, db_user.hashed_password
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Current password is incorrect",
+            )
+        return
+
+    # With no password to check, only a sign-in session (OIDC, for these
+    # accounts) proves the holder; long-lived tokens are refused.
+    if not auth_handler.is_session_authenticated(request, db_user.username):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Sign in to the web interface to change the username, password or email of this account",
+        )
+
+
+def _assert_can_manage_user(request: Request, target: User) -> None:
+    """Allow acting on yourself, or on another user with USERS_WRITE in the credential."""
+    if target.id == request.user.id:
+        return
+    if Scope.USERS_WRITE not in request.auth.scopes:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+    assert_admin_for_admin(
+        request, target.role, "Only an administrator can manage admin users"
+    )
 
 
 @protected_route(
@@ -72,16 +167,9 @@ def add_user(
         )
 
     coerced_role = Role.coerce(role)
-    # USERS_WRITE is delegable to non-admins via permission groups, but creating
-    # an admin must stay admin-only or it becomes a privilege-escalation path.
-    if (
-        admins_exist
-        and coerced_role == Role.ADMIN
-        and getattr(request.user, "role", None) != Role.ADMIN
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only an administrator can create admin users",
+    if admins_exist:
+        assert_admin_for_admin(
+            request, coerced_role, "Only an administrator can create admin users"
         )
 
     try:
@@ -117,7 +205,15 @@ def add_user(
         role=coerced_role,
     )
 
-    return UserSchema.model_validate(db_user_handler.add_user(user))
+    created_user = db_user_handler.add_user(user)
+    record(
+        AuditAction.USER_CREATE,
+        request,
+        AuditTarget.of_user(created_user),
+        {"role": created_user.role},
+    )
+
+    return UserSchema.model_validate(created_user)
 
 
 @protected_route(
@@ -157,15 +253,11 @@ def create_invite_link(
             detail=msg,
         )
 
-    # Mirrors add_user: only a real admin can mint admin invite links.
-    if (
-        admins_exist
-        and Role.coerce(role) == Role.ADMIN
-        and getattr(request.user, "role", None) != Role.ADMIN
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only an administrator can create admin invite links",
+    if admins_exist:
+        assert_admin_for_admin(
+            request,
+            Role.coerce(role),
+            "Only an administrator can create admin invite links",
         )
 
     if expiration is not None and expiration <= 0:
@@ -184,6 +276,7 @@ def create_invite_link(
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 def create_user_from_invite(
+    request: Request,
     username: str = Body(..., embed=True),
     email: str = Body(..., embed=True),
     password: str = Body(..., embed=True),
@@ -200,6 +293,10 @@ def create_user_from_invite(
     Returns:
         UserSchema: Newly created user
     """
+
+    # Ahead of the "already exists" checks, which would otherwise enumerate
+    # accounts for an invalid token. Not consumed, so a retry keeps the invite.
+    auth_handler.assert_invite_link_token_valid(token)
 
     try:
         validate_username(username)
@@ -236,6 +333,12 @@ def create_user_from_invite(
     )
 
     created_user = db_user_handler.add_user(user)
+    record(
+        AuditAction.USER_REGISTER,
+        AuditActor.for_user(created_user, ip_address=client_ip(request)),
+        AuditTarget.of_user(created_user),
+        {"role": created_user.role, "via": "invite"},
+    )
 
     return UserSchema.model_validate(created_user)
 
@@ -361,30 +464,59 @@ async def update_user(
         log.error(msg)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg)
 
-    # Admin users can edit any user, while other users can only edit self
-    if db_user.id != request.user.id and request.user.role != Role.ADMIN:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+    _assert_can_manage_user(request, db_user)
+
+    email = await _submitted_value(request, "email", form_data.email)
+    ra_username = await _submitted_value(request, "ra_username", form_data.ra_username)
+
+    # Usernames and emails match case-insensitively, so a case-only edit is no change.
+    new_username = (
+        form_data.username
+        if form_data.username and form_data.username.lower() != db_user.username.lower()
+        else None
+    )
+    new_email = (
+        email
+        if email is not None and email.lower() != (db_user.email or "").lower()
+        else None
+    )
+
+    if (
+        db_user.id == request.user.id
+        and new_email is not None
+        and db_user.email_managed_by_oidc
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your email is managed by your identity provider",
+        )
+
+    # Login is by username, so renaming locks the owner out as surely as a new password.
+    if db_user.id == request.user.id and (
+        new_username or form_data.password or new_email is not None
+    ):
+        await _verify_account_holder(request, db_user, form_data.current_password)
 
     cleaned_data: dict[str, Any] = {}
 
-    if form_data.username and form_data.username != db_user.username:
+    if new_username:
         try:
-            validate_username(form_data.username)
+            validate_username(new_username)
         except ValidationError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=exc.message,
             ) from exc
 
-        if db_user_handler.get_user_by_username(form_data.username):
-            msg = f"Username {form_data.username} already exists"
+        if db_user_handler.get_user_by_username(new_username):
+            msg = f"Username {new_username} already exists"
             log.error(msg)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=msg,
             )
 
-        cleaned_data["username"] = form_data.username.lower()
+        cleaned_data["username"] = new_username.lower()
 
     if form_data.password:
         try:
@@ -394,50 +526,50 @@ async def update_user(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=exc.message,
             ) from exc
-        cleaned_data["hashed_password"] = auth_handler.get_password_hash(
-            form_data.password
+        cleaned_data["hashed_password"] = await asyncio.to_thread(
+            auth_handler.get_password_hash, form_data.password
         )
 
-    if form_data.email is not None and form_data.email != db_user.email:
+    if new_email is not None:
         try:
-            validate_email(form_data.email)
+            validate_email(new_email)
         except ValidationError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=exc.message,
             ) from exc
 
-        if form_data.email and db_user_handler.get_user_by_email(form_data.email):
-            msg = f"User with email {form_data.email} already exists"
+        if new_email and db_user_handler.get_user_by_email(new_email):
+            msg = f"User with email {new_email} already exists"
             log.error(msg)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=msg,
             )
 
-        cleaned_data["email"] = form_data.email.lower() or None
+        cleaned_data["email"] = new_email.lower() or None
 
     # You can't change your own role
     if form_data.role and request.user.id != id:
-        new_role = Role.coerce(form_data.role)
-        # You can't demote the last admin (mirrors the delete guard).
-        if (
-            db_user.role == Role.ADMIN
-            and new_role != Role.ADMIN
-            and len(db_user_handler.get_admin_users()) == 1
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="You cannot demote the last admin user",
-            )
-        cleaned_data["role"] = new_role  # type: ignore[assignment]
+        cleaned_data["role"] = Role.coerce(form_data.role)
+        assert_admin_for_admin(
+            request,
+            cleaned_data["role"],
+            "Only an administrator can grant the admin role",
+        )
 
     # You can't disable yourself
     if form_data.enabled is not None and request.user.id != id:
-        cleaned_data["enabled"] = form_data.enabled  # type: ignore[assignment]
+        cleaned_data["enabled"] = form_data.enabled
 
-    if form_data.ra_username:
-        cleaned_data["ra_username"] = form_data.ra_username  # type: ignore[assignment]
+    # The synced progression belongs to the previously linked profile.
+    if ra_username:
+        cleaned_data["ra_username"] = ra_username
+        if ra_username != db_user.ra_username:
+            cleaned_data["ra_progression"] = {}
+    elif ra_username == "" and db_user.ra_username:
+        cleaned_data["ra_username"] = None
+        cleaned_data["ra_progression"] = {}
 
     if form_data.ui_settings is not None:
         try:
@@ -449,7 +581,7 @@ async def update_user(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=msg,
                 )
-            cleaned_data["ui_settings"] = ui_settings  # type: ignore[assignment]
+            cleaned_data["ui_settings"] = ui_settings
         except (json.JSONDecodeError, ValueError) as exc:
             msg = f"Invalid ui_settings JSON: {str(exc)}"
             log.error(msg)
@@ -471,24 +603,53 @@ async def update_user(
         cleaned_data["avatar_path"] = file_location
 
     if cleaned_data:
-        db_user_handler.update_user(id, cleaned_data)
+        # Sessions are keyed by username, so the old one is what identifies
+        # them once the update has renamed the account.
+        previous_username = db_user.username
+        creds_updated = cleaned_data.get("username") or cleaned_data.get(
+            "hashed_password"
+        )
+
+        try:
+            await auth_handler.apply_user_update(
+                id,
+                cleaned_data,
+                revoke_sessions_for=previous_username if creds_updated else None,
+                keep_an_admin=True,
+            )
+        except LastAdminError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You cannot demote the last admin user",
+            ) from exc
+
+        if creds_updated and request.user.id == id:
+            request.session.clear()
 
         # A role change alters the user's effective permissions; tell their UI.
         if "role" in cleaned_data:
             await emit_permissions_changed(id)
+            if cleaned_data["role"] != db_user.role:
+                await notify(
+                    id,
+                    NotificationKind.ROLE_CHANGED,
+                    NotificationLevel.INFO,
+                    {"role": cleaned_data["role"]},
+                    actor_id=request.user.id,
+                )
 
-        # Log out the current user if username or password changed
-        creds_updated = cleaned_data.get("username") or cleaned_data.get(
-            "hashed_password"
-        )
-        if request.user.id == id and creds_updated:
-            request.session.clear()
+        if cleaned_data.get("enabled") is False:
+            await close_client_token_sockets(
+                db_client_token_handler.get_token_ids_by_users([id])
+            )
 
+    before = db_user
     db_user = db_user_handler.get_user(id)
     if not db_user:
         msg = f"Username with id {id} not found"
         log.error(msg)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg)
+    _record_user_edit(request, before, db_user, cleaned_data)
 
     return UserSchema.model_validate(db_user)
 
@@ -522,13 +683,27 @@ async def delete_user(
     if request.user.id == id:
         raise HTTPException(status_code=400, detail="You cannot delete yourself")
 
-    # You can't delete the last admin user
-    if user.role == Role.ADMIN and len(db_user_handler.get_admin_users()) == 1:
+    _assert_can_manage_user(request, user)
+
+    token_ids = db_client_token_handler.get_token_ids_by_users([id])
+    device_ids = [device.id for device in db_device_handler.get_devices(user_id=id)]
+    try:
+        db_user_handler.delete_user(id, keep_an_admin=True)
+    except LastAdminError as exc:
         raise HTTPException(
             status_code=400, detail="You cannot delete the last admin user"
-        )
-
-    db_user_handler.delete_user(id)
+        ) from exc
+    await close_client_token_sockets(token_ids)
+    # Keyed by username, so they would otherwise pass for whoever takes it next.
+    await auth_handler.revoke_committed_credentials(user.username)
+    for device_id in device_ids:
+        await device_install_handler.discard_for_device(device_id)
+    record(
+        AuditAction.USER_DELETE,
+        request,
+        AuditTarget.of_user(user),
+        {"role": user.role},
+    )
 
     # Remove the user's folder
     user_avatar_path = fs_asset_handler.build_avatar_path(user=user)
@@ -542,9 +717,12 @@ async def delete_user(
     router.post,
     "/{id}/ra/refresh",
     [Scope.ME_WRITE],
-    status_code=status.HTTP_200_OK,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Refresh RetroAchievements",
-    responses={status.HTTP_404_NOT_FOUND: {}},
+    responses={
+        status.HTTP_404_NOT_FOUND: {},
+        status.HTTP_503_SERVICE_UNAVAILABLE: {},
+    },
 )
 async def refresh_retro_achievements(
     request: Request,
@@ -557,24 +735,19 @@ async def refresh_retro_achievements(
         ),
     ] = False,
 ) -> None:
-    """Refresh RetroAchievements progression data for a user."""
+    """Queue a refresh of a user's RetroAchievements progression; `ra:synced` reports when it ends."""
     user = db_user_handler.get_user(id)
+    if user:
+        _assert_can_manage_user(request, user)
     if not user or not user.ra_username:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User does not have a RetroAchievements username set",
         )
 
-    user_progression = await meta_ra_handler.get_user_progression(
-        user.ra_username,
-        current_progression=(
-            cast(RAUserProgression | None, user.ra_progression) if incremental else None
-        ),
-    )
-    db_user_handler.update_user(
-        id,
-        {
-            "ra_progression": user_progression,
-        },
-    )
+    if not queue_ra_progress_sync(id, refresh_all=not incremental):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Couldn't queue the RetroAchievements sync, try again later",
+        )
     return None

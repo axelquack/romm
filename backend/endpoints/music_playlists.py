@@ -1,15 +1,16 @@
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from fastapi import Path as PathVar
 from fastapi import Query, Request, Response, status
-from fastapi_pagination import resolve_params
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
 from decorators.auth import protected_route
 from endpoints.music import (
+    MUSIC_PAGE_QUERY,
     MusicPage,
+    MusicPageParams,
     MusicTrackIdsPayload,
     resolve_track_ids,
 )
@@ -78,7 +79,7 @@ def get_playlists(request: Request) -> list[MusicPlaylistSchema]:
     """The requesting user's playlists plus other users' public playlists."""
     playlists = db_music_playlist_handler.get_playlists(request.user.id)
     counts = db_music_playlist_handler.get_playlist_track_counts(
-        [p.id for p in playlists]
+        [p.id for p in playlists], get_permissions(request).rom_visibility
     )
     return [_playlist_schema(p, counts.get(p.id, 0)) for p in playlists]
 
@@ -109,7 +110,9 @@ def get_playlist(
     id: Annotated[int, PathVar(description="Playlist internal id.", ge=1)],
 ) -> MusicPlaylistSchema:
     playlist = _get_visible_playlist(request, id)
-    counts = db_music_playlist_handler.get_playlist_track_counts([playlist.id])
+    counts = db_music_playlist_handler.get_playlist_track_counts(
+        [playlist.id], get_permissions(request).rom_visibility
+    )
     return _playlist_schema(playlist, counts.get(playlist.id, 0))
 
 
@@ -136,7 +139,9 @@ def update_playlist(
             playlist = db_music_playlist_handler.update_playlist(id, data)
         except IntegrityError:
             raise MusicPlaylistAlreadyExistsException(data.get("name")) from None
-    counts = db_music_playlist_handler.get_playlist_track_counts([id])
+    counts = db_music_playlist_handler.get_playlist_track_counts(
+        [id], get_permissions(request).rom_visibility
+    )
     return _playlist_schema(playlist, counts.get(id, 0))
 
 
@@ -153,6 +158,7 @@ def delete_playlist(
 @protected_route(router.get, "/{id}/tracks", [Scope.PLAYLISTS_READ])
 def get_playlist_tracks(
     request: Request,
+    params: Annotated[MusicPageParams, Depends(MUSIC_PAGE_QUERY)],
     id: Annotated[int, PathVar(description="Playlist internal id.", ge=1)],
     order_by: Annotated[
         str,
@@ -160,16 +166,12 @@ def get_playlist_tracks(
     ] = "position",
     order_dir: Annotated[str, Query(description="asc or desc.")] = "asc",
 ) -> MusicPage[MusicTrackSchema]:
-    """Tracks of a playlist, in playlist order by default.
-
-    Entries hidden from the viewer are omitted, so the page total can be lower
-    than the playlist's stored track_count."""
+    """Tracks of a playlist, in playlist order by default, leaving out entries
+    hidden from the viewer."""
     playlist = _get_visible_playlist(request, id)
     perms = get_permissions(request)
-    params = resolve_params()
     rows, total = db_rom_handler.get_music_tracks(
-        hidden_platform_ids=perms.hidden_platform_ids,
-        hidden_rom_ids=perms.hidden_rom_ids,
+        visibility=perms.rom_visibility,
         order_by=order_by.lower(),
         order_dir=order_dir.lower(),
         limit=params.limit,
@@ -187,7 +189,7 @@ def add_playlist_tracks(
     request: Request,
     id: Annotated[int, PathVar(description="Playlist internal id.", ge=1)],
     payload: MusicTrackIdsPayload,
-) -> dict:
+) -> dict[str, Any]:
     """Append tracks to the playlist; tracks already present are ignored."""
     playlist = _get_owned_playlist(request, id)
     perms = get_permissions(request)
@@ -201,7 +203,7 @@ def remove_playlist_tracks(
     request: Request,
     id: Annotated[int, PathVar(description="Playlist internal id.", ge=1)],
     payload: MusicTrackIdsPayload,
-) -> dict:
+) -> dict[str, Any]:
     playlist = _get_owned_playlist(request, id)
     perms = get_permissions(request)
     rom_file_ids = resolve_track_ids(payload.rom_file_ids, perms)

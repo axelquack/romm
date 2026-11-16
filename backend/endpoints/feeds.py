@@ -4,7 +4,7 @@ import re
 from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import quote
 
 from fastapi import HTTPException
@@ -40,16 +40,15 @@ from endpoints.responses.feeds import (
     WebrcadeFeedSchema,
 )
 from handler.auth.constants import Scope
-from handler.auth.dependencies import get_permissions
+from handler.auth.dependencies import get_rom_visibility_filter
 from handler.database import db_platform_handler, db_rom_handler
 from handler.filesystem import fs_rom_handler
 from handler.metadata import meta_igdb_handler
 from handler.metadata.base_handler import (
     SONY_SERIAL_REGEX,
-    SWITCH_PRODUCT_ID_REGEX,
     SWITCH_TITLEDB_REGEX,
 )
-from handler.metadata.base_handler import UniversalPlatformSlug as UPS
+from models.platform import Platform
 from models.rom import (
     HAS_FILE_ON_DISK_FILTERS,
     Rom,
@@ -57,6 +56,8 @@ from models.rom import (
     RomFileCategory,
 )
 from utils.archives import is_compressed_file
+from utils.datetime import format_utc
+from utils.platform_slugs import UniversalPlatformSlug as UPS
 from utils.router import APIRouter
 
 
@@ -74,7 +75,7 @@ def generate_romfile_download_url(request: Request, file: RomFile) -> str:
     return str(
         request.url_for(
             "get_romfile_content",
-            id=file.id,
+            file_id=file.id,
             file_name=quote(file.file_name, safe="/"),
         )
     )
@@ -86,16 +87,11 @@ router = APIRouter(
 )
 
 
-def _hidden_ids(request: Request) -> tuple[list[int], list[int]]:
-    """Hidden (platform_ids, rom_ids) for the caller; empty when unauthenticated.
-
-    Feeds run unauthenticated under DISABLE_DOWNLOAD_ENDPOINT_AUTH, so there is
-    no caller to scope visibility to in that mode.
-    """
-    if not request.user.is_authenticated:
-        return [], []
-    perms = get_permissions(request)
-    return list(perms.hidden_platform_ids), list(perms.hidden_rom_ids)
+def _visible_platform_by_slug(request: Request, slug: str) -> Platform | None:
+    """A platform with `slug` the caller can see, or None."""
+    return db_platform_handler.get_platform_by_slug(
+        slug, visibility=get_rom_visibility_filter(request)
+    )
 
 
 def _platform_roms(
@@ -103,13 +99,10 @@ def _platform_roms(
 ) -> Sequence[Rom]:
     """Roms of a platform a feed can serve: nothing hidden from the caller, and
     nothing file-less (every feed entry carries a download URL)."""
-    hidden_platforms, hidden_roms = _hidden_ids(request)
-    if platform_id in hidden_platforms:
-        return []
     return db_rom_handler.get_roms_scalar(
         platform_ids=[platform_id],
         include_files=include_files,
-        hidden_rom_ids=hidden_roms,
+        visibility=get_rom_visibility_filter(request),
         **HAS_FILE_ON_DISK_FILTERS,
     )
 
@@ -130,8 +123,8 @@ def platforms_webrcade_feed(request: Request) -> WebrcadeFeedSchema:
         WebrcadeFeedSchema: Webrcade feed object schema
     """
 
-    hidden_platforms, hidden_roms = _hidden_ids(request)
-    platforms = db_platform_handler.get_platforms(hidden_platform_ids=hidden_platforms)
+    visibility = get_rom_visibility_filter(request)
+    platforms = db_platform_handler.get_platforms(visibility=visibility)
 
     categories = []
     for p in platforms:
@@ -141,8 +134,7 @@ def platforms_webrcade_feed(request: Request) -> WebrcadeFeedSchema:
         category_items = []
         roms = db_rom_handler.get_roms_scalar(
             platform_ids=[p.id],
-            hidden_platform_ids=hidden_platforms,
-            hidden_rom_ids=hidden_roms,
+            visibility=visibility,
             **HAS_FILE_ON_DISK_FILTERS,
         )
         for rom in roms:
@@ -196,7 +188,7 @@ def platforms_webrcade_feed(request: Request) -> WebrcadeFeedSchema:
 @protected_route(
     router.get,
     "/tinfoil",
-    [],
+    [] if DISABLE_DOWNLOAD_ENDPOINT_AUTH else [Scope.ROMS_READ],
 )
 async def tinfoil_index_feed(
     request: Request, slug: str = "switch"
@@ -211,7 +203,7 @@ async def tinfoil_index_feed(
     Returns:
         TinfoilFeedSchema: Tinfoil feed object schema
     """
-    switch = db_platform_handler.get_platform_by_slug(slug)
+    switch = _visible_platform_by_slug(request, slug)
     if not switch:
         return TinfoilFeedSchema(
             files=[],
@@ -221,11 +213,10 @@ async def tinfoil_index_feed(
 
     async def extract_titledb(
         roms: Sequence[Rom],
-    ) -> dict[str, dict]:
-        titledb: dict[str, dict] = {}
+    ) -> dict[str, dict[str, Any]]:
+        titledb: dict[str, dict[str, Any]] = {}
         for rom in roms:
             tdb_match = SWITCH_TITLEDB_REGEX.search(rom.fs_name)
-            pid_match = SWITCH_PRODUCT_ID_REGEX.search(rom.fs_name)
             if tdb_match:
                 (
                     _search_term,
@@ -233,34 +224,30 @@ async def tinfoil_index_feed(
                 ) = await meta_igdb_handler._switch_titledb_format(
                     tdb_match, rom.fs_name
                 )
-                if index_entry:
-                    key = str(index_entry.get("nsuId", None))
-                    if key is not None:  # only store if we have an id
-                        titledb[key] = TinfoilFeedTitleDBSchema(
-                            **index_entry
-                        ).model_dump()
-            elif pid_match:
+            else:
                 (
                     _search_term,
                     index_entry,
                 ) = await meta_igdb_handler._switch_productid_format(
-                    pid_match, rom.fs_name
+                    rom, rom.fs_name, rom.fs_name
                 )
-                if index_entry:
-                    key = str(index_entry.get("nsuId", None))
-                    if key is not None:
-                        titledb[key] = TinfoilFeedTitleDBSchema(
-                            **index_entry
-                        ).model_dump()
+
+            if not index_entry:
+                continue
+
+            # Tinfoil keys the index by nsuId, so an entry without one has no home.
+            nsu_id = index_entry.get("nsuId")
+            if nsu_id is not None:
+                titledb[str(nsu_id)] = TinfoilFeedTitleDBSchema(
+                    **index_entry
+                ).model_dump()
 
         return titledb
 
-    hidden_platforms, hidden_roms = _hidden_ids(request)
     roms = db_rom_handler.get_roms_scalar(
         platform_ids=[switch.id],
         include_files=True,
-        hidden_platform_ids=hidden_platforms,
-        hidden_rom_ids=hidden_roms,
+        visibility=get_rom_visibility_filter(request),
         **HAS_FILE_ON_DISK_FILTERS,
     )
 
@@ -272,7 +259,7 @@ async def tinfoil_index_feed(
             )
             for rom in roms
             for rom_file in rom.files
-            if rom_file.file_extension in ["xci", "nsp", "nsz", "xcz", "nro"]
+            if rom_file.file_extension.lower() in ["xci", "nsp", "nsz", "xcz", "nro"]
         ],
         directories=[],
         success=TINFOIL_WELCOME_MESSAGE,
@@ -366,7 +353,7 @@ def pkgi_ps3_feed(
     Returns:
         Response: txt file with PKGi PS3 database format
     """
-    ps3_platform = db_platform_handler.get_platform_by_slug(UPS.PS3)
+    ps3_platform = _visible_platform_by_slug(request, UPS.PS3)
     if not ps3_platform:
         raise HTTPException(status_code=404, detail="PlayStation 3 platform not found")
 
@@ -441,7 +428,7 @@ def pkgi_psvita_feed(
     Returns:
         Response: txt file with PKGi PS Vita database format
     """
-    psvita_platform = db_platform_handler.get_platform_by_slug(UPS.PSVITA)
+    psvita_platform = _visible_platform_by_slug(request, UPS.PSVITA)
     if not psvita_platform:
         raise HTTPException(
             status_code=404, detail="PlayStation Vita platform not found"
@@ -515,7 +502,7 @@ def pkgi_psp_feed(
     Returns:
         Response: txt file with PKGi PSP database format
     """
-    psp_platform = db_platform_handler.get_platform_by_slug(UPS.PSP)
+    psp_platform = _visible_platform_by_slug(request, UPS.PSP)
     if not psp_platform:
         raise HTTPException(
             status_code=404, detail="PlayStation Portable platform not found"
@@ -578,7 +565,7 @@ def format_release_date(timestamp: int | None) -> str | None:
     if not timestamp:
         return None
 
-    return datetime.fromtimestamp(timestamp / 1000).strftime("%m-%d-%Y")
+    return format_utc(timestamp, "%m-%d-%Y")
 
 
 FPKGI_CATEGORY_LABELS: dict[RomFileCategory, str] = {
@@ -670,7 +657,7 @@ def fpkgi_feed(
     Returns:
         Response: JSON file in FPKGi format
     """
-    platform = db_platform_handler.get_platform_by_slug(platform_slug)
+    platform = _visible_platform_by_slug(request, platform_slug)
     if not platform:
         raise HTTPException(
             status_code=404, detail=f"Platform {platform_slug} not found"
@@ -743,7 +730,7 @@ def kekatsu_ds_feed(request: Request, platform_slug: str) -> Response:
     Returns:
         Response: Text file with Kekatsu DS database format
     """
-    platform = db_platform_handler.get_platform_by_slug(platform_slug)
+    platform = _visible_platform_by_slug(request, platform_slug)
     if not platform:
         raise HTTPException(
             status_code=404, detail=f"Platform {platform_slug} not found"
@@ -806,7 +793,7 @@ def kekatsu_ds_feed(request: Request, platform_slug: str) -> Response:
     [] if DISABLE_DOWNLOAD_ENDPOINT_AUTH else [Scope.ROMS_READ],
 )
 def pkgj_psp_games_feed(request: Request) -> Response:
-    platform = db_platform_handler.get_platform_by_slug(UPS.PSP)
+    platform = _visible_platform_by_slug(request, UPS.PSP)
     if not platform:
         raise HTTPException(
             status_code=404, detail="PlayStation Portable platform not found"
@@ -870,7 +857,7 @@ def pkgj_psp_games_feed(request: Request) -> Response:
     [] if DISABLE_DOWNLOAD_ENDPOINT_AUTH else [Scope.ROMS_READ],
 )
 def pkgj_psp_dlcs_feed(request: Request) -> Response:
-    platform = db_platform_handler.get_platform_by_slug(UPS.PSP)
+    platform = _visible_platform_by_slug(request, UPS.PSP)
     if not platform:
         raise HTTPException(
             status_code=404, detail="PlayStation Portable platform not found"
@@ -932,7 +919,7 @@ def pkgj_psp_dlcs_feed(request: Request) -> Response:
     [] if DISABLE_DOWNLOAD_ENDPOINT_AUTH else [Scope.ROMS_READ],
 )
 def pkgj_psv_games_feed(request: Request) -> Response:
-    platform = db_platform_handler.get_platform_by_slug(UPS.PSVITA)
+    platform = _visible_platform_by_slug(request, UPS.PSVITA)
     if not platform:
         raise HTTPException(
             status_code=404, detail="PlayStation Vita platform not found"
@@ -997,7 +984,7 @@ def pkgj_psv_games_feed(request: Request) -> Response:
     [] if DISABLE_DOWNLOAD_ENDPOINT_AUTH else [Scope.ROMS_READ],
 )
 def pkgj_psv_dlcs_feed(request: Request) -> Response:
-    platform = db_platform_handler.get_platform_by_slug(UPS.PSVITA)
+    platform = _visible_platform_by_slug(request, UPS.PSVITA)
     if not platform:
         raise HTTPException(
             status_code=404, detail="PlayStation Vita platform not found"
@@ -1056,7 +1043,7 @@ def pkgj_psv_dlcs_feed(request: Request) -> Response:
     [] if DISABLE_DOWNLOAD_ENDPOINT_AUTH else [Scope.ROMS_READ],
 )
 def pkgj_psx_games_feed(request: Request) -> Response:
-    platform = db_platform_handler.get_platform_by_slug(UPS.PSX)
+    platform = _visible_platform_by_slug(request, UPS.PSX)
     if not platform:
         raise HTTPException(status_code=404, detail="PlayStation platform not found")
 

@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Body, File, HTTPException, Query, Request, UploadFile, status
@@ -7,12 +8,19 @@ from config import DISABLE_DOWNLOAD_ENDPOINT_AUTH
 from decorators.auth import protected_route
 from endpoints.responses import BulkOperationResponse
 from endpoints.responses.firmware import AddFirmwareResponse, FirmwareSchema
+from handler.audit_handler import (
+    AuditActor,
+    AuditDraft,
+    AuditTarget,
+    record,
+    record_many,
+)
 from handler.auth.constants import Scope
 from handler.auth.dependencies import (
     assert_can,
-    assert_firmware_visible,
-    assert_platform_visible,
     get_permissions,
+    visible_firmware_or_404,
+    visible_platform_or_404,
 )
 from handler.database import db_firmware_handler, db_platform_handler
 from handler.filesystem import fs_firmware_handler
@@ -20,6 +28,7 @@ from handler.scan_handler import scan_firmware
 from logger.formatter import BLUE
 from logger.formatter import highlight as hl
 from logger.logger import log
+from models.audit_event import AuditAction
 from models.firmware import Firmware
 from models.permission import PermAction, PermEntity
 from utils.router import APIRouter
@@ -50,46 +59,54 @@ async def add_firmware(
         AddFirmwareResponse: Standard message response
     """
 
-    db_platform = db_platform_handler.get_platform(platform_id)
-    if not db_platform:
-        error = f"Platform with ID {platform_id} not found"
-        log.error(error)
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error)
-
     # Platform-hide cascades to firmware; 404-mask uploads to hidden platforms.
-    assert_platform_visible(
+    db_platform = visible_platform_or_404(
         request,
-        db_platform,
-        not_found_detail=f"Platform with ID {platform_id} not found",
+        db_platform_handler.get_platform(platform_id),
+        f"Platform with ID {platform_id} not found",
     )
 
-    uploaded_firmware = []
-    firmware_path = fs_firmware_handler.get_firmware_fs_structure(db_platform.fs_slug)
-
+    # write_file stores each upload under its sanitized basename, so the lookup,
+    # scan and row must use that same name. Check them all before writing any.
+    uploads: list[tuple[UploadFile, str]] = []
     for file in files:
         if not file.filename:
             log.warning("Empty filename, skipping")
             continue
+        try:
+            file_name = fs_firmware_handler._sanitize_filename(file.filename)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid upload filename: {exc}",
+            ) from exc
+        uploads.append((file, file_name))
 
+    uploaded_firmware = []
+    firmware_path = fs_firmware_handler.get_firmware_fs_structure(db_platform.fs_slug)
+
+    for file, file_name in uploads:
         log.info(
-            f"Uploading firmware {hl(file.filename)} to {hl(db_platform.custom_name or db_platform.name, color=BLUE)}"
+            f"Uploading firmware {hl(file_name)} to {hl(db_platform.custom_name or db_platform.name, color=BLUE)}"
         )
 
-        await fs_firmware_handler.write_file(file=file, path=firmware_path)
+        await fs_firmware_handler.write_file(
+            file=file, path=firmware_path, filename=file_name
+        )
 
         db_firmware = db_firmware_handler.get_firmware_by_filename(
-            platform_id=db_platform.id, file_name=file.filename
+            platform_id=db_platform.id, file_name=file_name
         )
         # Scan or update firmware
         scanned_firmware = await scan_firmware(
             platform=db_platform,
-            file_name=file.filename,
+            file_name=file_name,
             firmware=db_firmware,
         )
 
         is_verified = Firmware.verify_file_hashes(
             platform_slug=db_platform.slug,
-            file_name=file.filename,
+            file_name=file_name,
             file_size_bytes=scanned_firmware.file_size_bytes,
             md5_hash=scanned_firmware.md5_hash,
             sha1_hash=scanned_firmware.sha1_hash,
@@ -110,6 +127,13 @@ async def add_firmware(
         scanned_firmware.is_verified = is_verified
         db_firmware_handler.add_firmware(scanned_firmware)
         uploaded_firmware.append(scanned_firmware)
+
+    record(
+        AuditAction.FIRMWARE_UPLOAD,
+        request,
+        AuditTarget.of_platform(db_platform),
+        {"file_names": [file_name for _, file_name in uploads]},
+    )
 
     return {
         "uploaded": len(files),
@@ -163,11 +187,9 @@ def get_firmware_identifiers(
         list[int]: List of firmware IDs
     """
     perms = get_permissions(request)
-    firmware = db_firmware_handler.list_firmware(
-        only_fields=[Firmware.id],
+    return db_firmware_handler.list_firmware_ids(
         hidden_platform_ids=perms.hidden_platform_ids,
     )
-    return [f.id for f in firmware]
 
 
 @protected_route(
@@ -185,15 +207,37 @@ def get_firmware(request: Request, id: int) -> FirmwareSchema:
     Returns:
         FirmwareSchema: Firmware stored in the database
     """
-    firmware = db_firmware_handler.get_firmware(id)
-    if not firmware:
-        error = f"Firmware with ID {id} not found"
+    firmware = visible_firmware_or_404(
+        request, db_firmware_handler.get_firmware(id), id
+    )
+
+    return FirmwareSchema.model_validate(firmware)
+
+
+def _resolve_firmware_content(request: Request, id: int) -> tuple[Firmware, Path]:
+    """Resolve a firmware row and the readable file backing it.
+
+    Args:
+        request (Request): Fastapi Request object
+        id (int): Firmware internal id
+
+    Returns:
+        tuple[Firmware, Path]: The firmware row and its absolute path on disk
+    """
+
+    firmware = visible_firmware_or_404(
+        request, db_firmware_handler.get_firmware(id), id
+    )
+
+    firmware_path = fs_firmware_handler.validate_path(firmware.full_path)
+    # A row can outlive its file: the scan marks it missing, or it was moved
+    # away without one. Either way FileResponse would raise a 500.
+    if firmware.missing_from_fs or not firmware_path.is_file():
+        error = f"Firmware file '{firmware.file_name}' is missing from filesystem"
         log.error(error)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error)
 
-    assert_firmware_visible(request, firmware)
-
-    return FirmwareSchema.model_validate(firmware)
+    return firmware, firmware_path
 
 
 @protected_route(
@@ -201,7 +245,7 @@ def get_firmware(request: Request, id: int) -> FirmwareSchema:
     "/{id}/content/{file_name}",
     [] if DISABLE_DOWNLOAD_ENDPOINT_AUTH else [Scope.FIRMWARE_READ],
 )
-def head_firmware_content(request: Request, id: int, file_name: str):
+def head_firmware_content(request: Request, id: int, file_name: str) -> FileResponse:
     """Head firmware content endpoint
 
     Args:
@@ -213,15 +257,7 @@ def head_firmware_content(request: Request, id: int, file_name: str):
         FileResponse: Returns the response with headers
     """
 
-    firmware = db_firmware_handler.get_firmware(id)
-    if not firmware:
-        error = f"Firmware with ID {id} not found"
-        log.error(error)
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error)
-
-    assert_firmware_visible(request, firmware)
-
-    firmware_path = fs_firmware_handler.validate_path(firmware.full_path)
+    firmware, firmware_path = _resolve_firmware_content(request, id)
 
     return FileResponse(
         path=firmware_path,
@@ -241,7 +277,7 @@ def get_firmware_content(
     request: Request,
     id: int,
     file_name: str,
-):
+) -> FileResponse:
     """Download firmware endpoint
 
     Args:
@@ -253,15 +289,7 @@ def get_firmware_content(
         FileResponse: Returns the firmware file
     """
 
-    firmware = db_firmware_handler.get_firmware(id)
-    if not firmware:
-        error = f"Firmware with ID {id} not found"
-        log.error(error)
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error)
-
-    assert_firmware_visible(request, firmware)
-
-    firmware_path = fs_firmware_handler.validate_path(firmware.full_path)
+    firmware, firmware_path = _resolve_firmware_content(request, id)
 
     return FileResponse(path=firmware_path, filename=firmware.file_name)
 
@@ -293,6 +321,8 @@ async def delete_firmware(
     successful_items = 0
     failed_ids = []
     errors = []
+    actor = AuditActor.from_request(request)
+    audit_drafts: list[AuditDraft] = []
 
     for id in firmware:
         fw = db_firmware_handler.get_firmware(id)
@@ -302,15 +332,18 @@ async def delete_firmware(
             errors.append(f"Firmware with ID {id} not found")
             continue
 
+        deleted = removed = False
         try:
             log.info(f"Deleting {hl(fw.file_name)} from database")
             db_firmware_handler.delete_firmware(id)
+            deleted = True
 
             if id in delete_from_fs:
                 log.info(f"Deleting {hl(fw.file_name)} from filesystem")
                 try:
                     file_path = f"{fw.file_path}/{fw.file_name}"
                     await fs_firmware_handler.remove_file(file_path=file_path)
+                    removed = True
                 except FileNotFoundError:
                     error = f"Firmware file {hl(fw.file_name)} not found for platform {hl(fw.platform.slug)}"
                     log.error(error)
@@ -322,7 +355,19 @@ async def delete_firmware(
         except Exception as e:
             failed_ids.append(id)
             errors.append(f"Failed to delete firmware {id}: {str(e)}")
+        finally:
+            # The row is gone whatever became of its file.
+            if deleted:
+                audit_drafts.append(
+                    AuditDraft(
+                        AuditAction.FIRMWARE_DELETE,
+                        actor,
+                        AuditTarget.of_firmware(fw),
+                        {"deleted_from_fs": removed},
+                    )
+                )
 
+    record_many(audit_drafts)
     return {
         "successful_items": successful_items,
         "failed_ids": failed_ids,

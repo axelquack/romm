@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ChannelSchema } from './ChannelSchema';
 import type { ManualMetadata } from './ManualMetadata';
 import type { RomCsdbMetadata } from './RomCsdbMetadata';
 import type { RomDemozooMetadata } from './RomDemozooMetadata';
@@ -17,8 +18,10 @@ import type { RomMobyMetadata } from './RomMobyMetadata';
 import type { RomPouetMetadata } from './RomPouetMetadata';
 import type { RomRAMetadata } from './RomRAMetadata';
 import type { RomSSMetadata } from './RomSSMetadata';
+import type { RomSteamMetadata } from './RomSteamMetadata';
 import type { RomUserSchema } from './RomUserSchema';
 import type { SaveSchema } from './SaveSchema';
+import type { SaveTargetLayout } from './SaveTargetLayout';
 import type { ScreenshotSchema } from './ScreenshotSchema';
 import type { SiblingRomSchema } from './SiblingRomSchema';
 import type { StateSchema } from './StateSchema';
@@ -42,6 +45,7 @@ export type DetailedRomSchema = {
     demozoo_id: (number | null);
     pouet_id: (number | null);
     csdb_id: (number | null);
+    steam_id: (number | null);
     gamelist_id: (string | null);
     libretro_id: (string | null);
     platform_id: number;
@@ -72,6 +76,7 @@ export type DetailedRomSchema = {
     demozoo_metadata: (RomDemozooMetadata | null);
     pouet_metadata: (RomPouetMetadata | null);
     csdb_metadata: (RomCsdbMetadata | null);
+    steam_metadata: (RomSteamMetadata | null);
     gamelist_metadata: (RomGamelistMetadata | null);
     manual_metadata: (ManualMetadata | null);
     path_cover_small: (string | null);
@@ -86,6 +91,7 @@ export type DetailedRomSchema = {
     is_unidentified: boolean;
     is_identified: boolean;
     revision: (string | null);
+    version: (string | null);
     regions: Array<string>;
     languages: Array<string>;
     tags: Array<string>;
@@ -93,9 +99,13 @@ export type DetailedRomSchema = {
     md5_hash: (string | null);
     sha1_hash: (string | null);
     ra_hash: (string | null);
+    title_id: (string | null);
+    save_target: (string | null);
+    save_target_layout: (SaveTargetLayout | null);
     has_simple_single_file: boolean;
     has_nested_single_file: boolean;
     has_multiple_files: boolean;
+    is_easyrpg_game: boolean;
     full_path: string;
     created_at: string;
     updated_at: string;
@@ -113,9 +123,13 @@ export type DetailedRomSchema = {
     user_states: Array<StateSchema>;
     all_user_saves: Array<UserSaveSchema>;
     all_user_states: Array<UserStateSchema>;
+    user_channels: Array<ChannelSchema>;
+    channel_file_id: (number | null);
+    snapshot_save_ids: Array<number>;
     user_screenshots: Array<ScreenshotSchema>;
     all_user_screenshots: Array<UserScreenshotSchema>;
     user_collections: Array<UserCollectionSchema>;
     all_user_notes: Array<UserNoteSchema>;
+    download_formats: Array<string>;
 };
 

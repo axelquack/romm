@@ -4,9 +4,11 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from models.user import TEXT_FIELD_LENGTH
 from utils.validation import (
     ValidationError,
     narrow_rom_id_scope,
+    sanitize_username,
     validate_ascii_only,
     validate_email,
     validate_password,
@@ -96,6 +98,37 @@ class TestValidateUsername:
         assert True
 
 
+class TestSanitizeUsername:
+    """Test coercion of provider-supplied usernames."""
+
+    @pytest.mark.parametrize(
+        ("supplied", "expected"),
+        [
+            ("already_valid-1", "already_valid-1"),
+            ("first.last", "first-last"),
+            ("first.last@example.com", "first-last-example-com"),
+            ("  spaced  out  ", "spaced-out"),
+            (".leading.and.trailing.", "leading-and-trailing"),
+            ("naïve", "na-ve"),
+        ],
+    )
+    def test_sanitized_usernames_pass_validation(self, supplied, expected):
+        sanitized = sanitize_username(supplied)
+        assert sanitized == expected
+        validate_username(sanitized)
+
+    def test_falls_back_when_nothing_usable_survives(self):
+        assert sanitize_username("ユーザー", fallback="someone") == "someone"
+        assert sanitize_username("...", fallback="...") == "user"
+
+    def test_truncates_to_the_column_length(self):
+        assert len(sanitize_username("a" * 300)) == TEXT_FIELD_LENGTH
+
+    @given(st.text(min_size=1))
+    def test_any_input_sanitizes_to_a_valid_username(self, supplied):
+        validate_username(sanitize_username(supplied))
+
+
 class TestValidatePassword:
     """Test password validation."""
 
@@ -160,6 +193,14 @@ class TestValidateEmail:
         with pytest.raises(ValidationError) as exc_info:
             validate_email("résumé@example.com")
         assert "ASCII characters" in exc_info.value.message
+
+    def test_email_over_column_length(self):
+        """An email the column cannot hold fails validation, not the insert."""
+        domain = "@example.com"
+        validate_email("a" * (TEXT_FIELD_LENGTH - len(domain)) + domain)
+        with pytest.raises(ValidationError) as exc_info:
+            validate_email("a" * (TEXT_FIELD_LENGTH - len(domain) + 1) + domain)
+        assert "no more than 255 characters" in exc_info.value.message
 
 
 _USERNAME_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
